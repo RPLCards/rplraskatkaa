@@ -47,17 +47,26 @@ PUCK_BOT_USERNAME = "@rplpuck_bot"
 SCHEDULER_INTERVAL = 20
 WARNING_AUTODELETE_SECONDS = 10
 ADMIN_RIGHTS_CHECK_INTERVAL = 300  # 5 минут
-ROSTER_CHECK_INTERVAL = 300        # 5 минут (автопроверка составов)
-STEAM_REMINDER_INTERVAL = 10800    # 3 часа (10800 сек)
+ROSTER_CHECK_INTERVAL = 300        # 5 минут
+STEAM_REMINDER_INTERVAL = 10800    # 3 часа
 
 MSK = ZoneInfo("Europe/Moscow")
 
 # Регулярное выражение для никнейма: "Nick #Number" (например: Ovechkin #8)
 NICKNAME_PATTERN = re.compile(r"^.+\s+#\d+$")
 
+# Проверка корректности SteamID (ТОЛЬКО SteamID/кастомный ID, без ссылок и доменов)
+def is_valid_steam_id(raw_input: str) -> bool:
+    s = raw_input.strip()
+    if any(bad in s.lower() for bad in ["http://", "https://", "steamcommunity.com", "/", "\\", "?", "#"]):
+        return False
+    # Подходит под SteamID64, STEAM_0:..., [U:1:...], или кастомный vanity ID (буквы, цифры, _, -)
+    pattern = re.compile(r"^(7656\d{13}|STEAM_[0-5]:[0-1]:\d+|\[U:[0-1]:\d+\]|[a-zA-Z0-9_\-]{3,32})$")
+    return bool(pattern.match(s))
+
 
 def esc(value) -> str:
-    return escape(str(value))
+    return escape(str(value if value is not None else ""))
 
 
 # =========================================================
@@ -69,7 +78,7 @@ _pool: asyncpg.Pool | None = None
 
 async def init_pool():
     global _pool
-    _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=10, command_timeout=15)
+    _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=2, max_size=20, command_timeout=10)
     async with _pool.acquire() as conn:
         await conn.execute(
             """
@@ -129,7 +138,7 @@ async def init_pool():
                 tg_id BIGINT PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
-                steam_id TEXT,
+                steam_id TEXT UNIQUE,
                 nickname TEXT,
                 team_chat_id BIGINT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -155,6 +164,7 @@ async def init_pool():
             CREATE TABLE IF NOT EXISTS bans (
                 id SERIAL PRIMARY KEY,
                 tg_id BIGINT NOT NULL,
+                league TEXT NOT NULL DEFAULT 'ALL',
                 reason TEXT NOT NULL,
                 until TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -165,6 +175,12 @@ async def init_pool():
                 tg_id BIGINT UNIQUE NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+
+            -- Индексы для оптимизации скорости ответов бота
+            CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_chat_id);
+            CREATE INDEX IF NOT EXISTS idx_bans_tg_id ON bans(tg_id);
+            CREATE INDEX IF NOT EXISTS idx_player_chats_tg ON player_chats(tg_id);
+            CREATE INDEX IF NOT EXISTS idx_player_chats_chat ON player_chats(chat_id);
             """
         )
 
@@ -172,18 +188,7 @@ async def init_pool():
             "ALTER TABLE chats ADD COLUMN IF NOT EXISTS league TEXT NOT NULL DEFAULT 'RPL'",
             "ALTER TABLE chats ADD COLUMN IF NOT EXISTS logo_emoji_id TEXT",
             "ALTER TABLE chats ADD COLUMN IF NOT EXISTS logo_emoji TEXT",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS team_home_chat_id BIGINT NOT NULL DEFAULT 0",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS team_home_name TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS team_away_chat_id BIGINT NOT NULL DEFAULT 0",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS team_away_name TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS match_time TIMESTAMPTZ NOT NULL DEFAULT NOW()",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS server_name TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS server_ip TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS server_port TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS server_password TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS notified_45 BOOLEAN NOT NULL DEFAULT FALSE",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS notified_15 BOOLEAN NOT NULL DEFAULT FALSE",
-            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "ALTER TABLE bans ADD COLUMN IF NOT EXISTS league TEXT NOT NULL DEFAULT 'ALL'",
         ]
         for cmd in alter_commands:
             try:
@@ -203,8 +208,10 @@ async def add_chat(chat_id: int, name: str, league: str):
         )
 
 
-async def get_chats():
+async def get_chats(league: str | None = None):
     async with _pool.acquire() as conn:
+        if league:
+            return await conn.fetch("SELECT * FROM chats WHERE league = $1 ORDER BY name", league)
         return await conn.fetch("SELECT * FROM chats ORDER BY league, name")
 
 
@@ -216,11 +223,6 @@ async def get_chat(chat_id: int):
 async def update_chat_name(chat_id: int, name: str):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE chats SET name = $1 WHERE chat_id = $2", name, chat_id)
-
-
-async def update_chat_league(chat_id: int, league: str):
-    async with _pool.acquire() as conn:
-        await conn.execute("UPDATE chats SET league = $1 WHERE chat_id = $2", league, chat_id)
 
 
 async def update_chat_emoji(chat_id: int, emoji_id: str, emoji_char: str):
@@ -281,11 +283,6 @@ async def add_channel(channel_id: int, title: str):
 async def get_channels():
     async with _pool.acquire() as conn:
         return await conn.fetch("SELECT * FROM channels ORDER BY title")
-
-
-async def get_channel(channel_id: int):
-    async with _pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM channels WHERE channel_id = $1", channel_id)
 
 
 async def link_channel_chat(channel_id: int, chat_id: int):
@@ -416,6 +413,22 @@ async def get_player(tg_id: int):
         return await conn.fetchrow("SELECT * FROM players WHERE tg_id = $1", tg_id)
 
 
+async def get_all_players_db(limit: int = 100, offset: int = 0):
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.*, c.name as team_name, c.league as team_league
+            FROM players p
+            LEFT JOIN chats c ON c.chat_id = p.team_chat_id
+            ORDER BY p.created_at DESC
+            LIMIT $1 OFFSET $2
+            """,
+            limit, offset,
+        )
+        total = await conn.fetchval("SELECT COUNT(*) FROM players")
+        return rows, total
+
+
 async def get_player_by_username(username: str):
     async with _pool.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM players WHERE lower(username) = lower($1)", username)
@@ -431,6 +444,11 @@ async def set_player_steam(tg_id: int, steam_id: str):
         await conn.execute("UPDATE players SET steam_id = $1 WHERE tg_id = $2", steam_id, tg_id)
 
 
+async def reset_all_players_steam_ids():
+    async with _pool.acquire() as conn:
+        await conn.execute("UPDATE players SET steam_id = NULL")
+
+
 async def set_player_nickname(tg_id: int, nickname: str):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET nickname = $1 WHERE tg_id = $2", nickname, tg_id)
@@ -444,14 +462,12 @@ async def set_player_team(tg_id: int, chat_id: int | None):
         if old_chat_id == chat_id:
             return
 
-        # Завершаем предыдущую запись истории
         if old_chat_id:
             await conn.execute(
                 "UPDATE player_history SET left_at = NOW() WHERE tg_id = $1 AND chat_id = $2 AND left_at IS NULL",
                 tg_id, old_chat_id,
             )
 
-        # Создаем новую запись в истории
         if chat_id:
             chat_info = await conn.fetchrow("SELECT name, league FROM chats WHERE chat_id = $1", chat_id)
             if chat_info:
@@ -509,13 +525,13 @@ async def get_unlinked_steam_in_teams() -> list[dict]:
         )
 
 
+# ФИКС ИСКЛЮЧЕНИЙ: Состав отображается СТРОГО по заданной в профиле команде (team_chat_id)
 async def get_team_roster(chat_id: int):
     async with _pool.acquire() as conn:
         return await conn.fetch(
             """
             SELECT p.* FROM players p
-            JOIN player_chats pc ON pc.tg_id = p.tg_id
-            WHERE pc.chat_id = $1
+            WHERE p.team_chat_id = $1
             ORDER BY p.nickname NULLS LAST, p.first_name
             """,
             chat_id,
@@ -532,24 +548,30 @@ async def get_player_history(tg_id: int):
 
 # ---------- Баны ----------
 
-async def ban_player_db(tg_id: int, reason: str, until: datetime | None):
+async def ban_player_db(tg_id: int, league: str, reason: str, until: datetime | None):
     async with _pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO bans (tg_id, reason, until) VALUES ($1, $2, $3)",
-            tg_id, reason, until,
+            "INSERT INTO bans (tg_id, league, reason, until) VALUES ($1, $2, $3, $4)",
+            tg_id, league, reason, until,
         )
 
 
-async def unban_player_db(tg_id: int):
+async def unban_player_db(ban_id: int):
     async with _pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM bans WHERE tg_id = $1 AND (until IS NULL OR until > NOW())",
-            tg_id,
-        )
+        await conn.execute("DELETE FROM bans WHERE id = $1", ban_id)
 
 
-async def get_active_ban(tg_id: int):
+async def get_active_ban(tg_id: int, league: str | None = None):
     async with _pool.acquire() as conn:
+        if league:
+            return await conn.fetchrow(
+                """
+                SELECT * FROM bans 
+                WHERE tg_id = $1 AND (league = $2 OR league = 'ALL') AND (until IS NULL OR until > NOW()) 
+                ORDER BY id DESC LIMIT 1
+                """,
+                tg_id, league,
+            )
         return await conn.fetchrow(
             "SELECT * FROM bans WHERE tg_id = $1 AND (until IS NULL OR until > NOW()) ORDER BY id DESC LIMIT 1",
             tg_id,
@@ -560,10 +582,9 @@ async def get_active_bans():
     async with _pool.acquire() as conn:
         return await conn.fetch(
             """
-            SELECT DISTINCT ON (tg_id) *
-            FROM bans
+            SELECT * FROM bans
             WHERE (until IS NULL OR until > NOW())
-            ORDER BY tg_id, id DESC
+            ORDER BY id DESC
             """
         )
 
@@ -699,6 +720,7 @@ class EditChat(StatesGroup):
 
 class BanPlayer(StatesGroup):
     waiting_target = State()
+    waiting_league = State()
     waiting_reason = State()
     waiting_duration = State()
 
@@ -727,6 +749,7 @@ def admin_main_menu() -> InlineKeyboardMarkup:
     kb.button(text="➕ Добавить команду", callback_data="adm:add_chat")
     kb.button(text="👑 Чаты капитанов", callback_data="adm:captains_menu")
     kb.button(text="📋 Список команд", callback_data="adm:list_chats")
+    kb.button(text="👥 Все игроки", callback_data="adm:all_players:0")
     kb.button(text="✏️ Ред. команду", callback_data="adm:edit_chat")
     kb.button(text="🆚 Добавить матч", callback_data="adm:add_match")
     kb.button(text="📅 Список матчей", callback_data="adm:list_matches")
@@ -737,15 +760,26 @@ def admin_main_menu() -> InlineKeyboardMarkup:
     kb.button(text="🛡 Исключения", callback_data="adm:exceptions_menu")
     kb.button(text="👤 Ред. профиля", callback_data="adm:edit_profile")
     kb.button(text="🚫 Забанить игрока", callback_data="adm:ban_player")
-    kb.button(text="📋 Баны", callback_data="adm:list_bans")
+    kb.button(text="📋 Список банов", callback_data="adm:list_bans")
+    kb.button(text="🔄 Сбросить всем SteamID", callback_data="adm:reset_steam_confirm")
     kb.adjust(2)
     return kb.as_markup()
 
 
 def league_choice_kb(prefix: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🏆 Основная лига (RPL)", callback_data=f"{prefix}:RPL")
-    kb.button(text="🏒 Фарм лига (FPHL)", callback_data=f"{prefix}:FPHL")
+    kb.button(text="🏆 RPL", callback_data=f"{prefix}:RPL")
+    kb.button(text="🏒 FPHL", callback_data=f"{prefix}:FPHL")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def ban_league_choice_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏆 Только RPL", callback_data="banleague:RPL")
+    kb.button(text="🏒 Только FPHL", callback_data="banleague:FPHL")
+    kb.button(text="🚫 В обеих лигах (ALL)", callback_data="banleague:ALL")
     kb.button(text="⬅️ В меню", callback_data="adm:menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -874,7 +908,7 @@ def ban_duration_kb() -> InlineKeyboardMarkup:
 def bans_list_kb(bans) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for b in bans:
-        kb.button(text=f"✅ Разбанить {b['tg_id']}", callback_data=f"adm:unban:{b['tg_id']}")
+        kb.button(text=f"✅ Разбанить #{b['id']} ({b['tg_id']})", callback_data=f"adm:unban:{b['id']}")
     kb.button(text="⬅️ В меню", callback_data="adm:menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -932,7 +966,7 @@ def is_authed(user_id: int) -> bool:
 
 
 @start_router.message(CommandStart(), F.chat.type != "private")
-async def cmd_start(message: Message):
+async def cmd_start_chat(message: Message):
     text = (
         "👋 <b>Привет!</b>\n\n"
         "Данный бот предназначен для автоматизации раскаток, ведения составов и уведомлений RPL / FPHL.\n\n"
@@ -964,7 +998,46 @@ async def on_channel_post(message: Message, bot: Bot):
             logging.warning(f"⚠️ Не удалось переслать пост в чат {chat_id}: {e}")
 
 
-# ---------- Авторизация ----------
+# ---------- Команда /lineup ----------
+
+@start_router.message(Command("lineup"))
+async def cmd_lineup(message: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏆 RPL", callback_data="lineup_league:RPL")
+    kb.button(text="🏒 FPHL", callback_data="lineup_league:FPHL")
+    kb.adjust(2)
+    await message.answer("🏒 <b>Выберите лигу для просмотра составов:</b>", reply_markup=kb.as_markup())
+
+
+@start_router.callback_query(F.data.startswith("lineup_league:"))
+async def cb_lineup_league(call: CallbackQuery):
+    league = call.data.split(":")[1]
+    chats = await get_chats(league)
+    if not chats:
+        await call.answer(f"В лиге {league} пока нет команд.", show_alert=True)
+        return
+    kb = InlineKeyboardBuilder()
+    for c in chats:
+        logo = f"{c['logo_emoji']} " if c["logo_emoji"] else ""
+        kb.button(text=f"{logo}{c['name']}", callback_data=f"team_view:{c['chat_id']}")
+    kb.button(text="⬅️ Выбор лиги", callback_data="lineup_back")
+    kb.adjust(1)
+    await call.message.edit_text(f"🏒 <b>Команды лиги {league}:</b>", reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@start_router.callback_query(F.data == "lineup_back")
+async def cb_lineup_back(call: CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏆 RPL", callback_data="lineup_league:RPL")
+    kb.button(text="🏒 FPHL", callback_data="lineup_league:FPHL")
+    kb.adjust(2)
+    await call.message.edit_text("🏒 <b>Выберите лигу для просмотра составов:</b>", reply_markup=kb.as_markup())
+    await call.answer()
+
+
+# ---------- Авторизация Админки ----------
+
 @auth_router.message(Command("adminkarpl"))
 async def cmd_admin(message: Message, state: FSMContext):
     if is_authed(message.from_user.id):
@@ -1017,7 +1090,107 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+# ---------- "Посмотреть всех игроков" & "Сбросить SteamID" ----------
+
+@panel_router.callback_query(F.data.startswith("adm:all_players:"))
+async def cb_admin_all_players(call: CallbackQuery):
+    page = int(call.data.split(":")[2])
+    limit = 15
+    offset = page * limit
+    players, total = await get_all_players_db(limit=limit, offset=offset)
+
+    if not players:
+        await call.message.edit_text("📋 Игроки в базе отсутствуют.", reply_markup=back_to_menu_kb())
+        await call.answer()
+        return
+
+    lines = []
+    for p in players:
+        nick = esc(p["nickname"]) if p["nickname"] else esc(p["first_name"] or "Игрок")
+        team = f"[{p['team_league']}] {esc(p['team_name'])}" if p["team_name"] else "Free Agent"
+        steam = f"<code>{esc(p['steam_id'])}</code>" if p["steam_id"] else "❌"
+        user = f"@{esc(p['username'])}" if p["username"] else f"ID:{p['tg_id']}"
+        lines.append(f"👤 <b>{nick}</b> ({user})\n   ↳ Команда: {team} | SteamID: {steam}")
+
+    total_pages = (total + limit - 1) // limit
+    text = f"👥 <b>Все зарегистрированные игроки ({total}):</b> (Стр. {page + 1}/{total_pages})\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n".join(lines)
+
+    kb = InlineKeyboardBuilder()
+    if page > 0:
+        kb.button(text="◀️ Назад", callback_data=f"adm:all_players:{page - 1}")
+    if (page + 1) < total_pages:
+        kb.button(text="Вперёд ▶️", callback_data=f"adm:all_players:{page + 1}")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(2, 1)
+
+    await call.message.edit_text(text, reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@panel_router.callback_query(F.data == "adm:reset_steam_confirm")
+async def cb_admin_reset_steam_confirm(call: CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔥 ДА, СБРОСИТЬ ВСЕМ", callback_data="adm:reset_steam_execute")
+    kb.button(text="❌ Отмена", callback_data="adm:menu")
+    kb.adjust(1)
+
+    await call.message.edit_text(
+        "⚠️ <b>ВНИМАНИЕ! Вы действительно хотите сбросить SteamID ВСЕМ игрокам?</b>\n\n"
+        "После этого бот автоматически уведомит абсолютно всех игроков в личные сообщения, "
+        "а также отправит объявления во все командные чаты!",
+        reply_markup=kb.as_markup(),
+    )
+    await call.answer()
+
+
+@panel_router.callback_query(F.data == "adm:reset_steam_execute")
+async def cb_admin_reset_steam_execute(call: CallbackQuery, bot: Bot):
+    await reset_all_players_steam_ids()
+    await call.message.edit_text("✅ Все SteamID сброшены! Запущена рассылка везде (кроме каналов)...", reply_markup=back_to_menu_kb())
+    await call.answer()
+
+    # Фоновая рассылка всем пользователям в ЛС и во все командные чаты
+    asyncio.create_task(broadcast_steam_reset(bot))
+
+
+async def broadcast_steam_reset(bot: Bot):
+    reset_text = (
+        "📢 <b>ВНИМАНИЕ ВСЕМ ИГРОКАМ!</b>\n\n"
+        "Администрация лиги выполнила <b>сброс SteamID</b> для всех игроков.\n"
+        "Пожалуйста, зайдите в личные сообщения бота и привяжите ваш <b>SteamID</b> заново!"
+    )
+
+    # 1. Рассылка во все командные и капитанские чаты
+    chats = await get_chats()
+    for c in chats:
+        try:
+            await bot.send_message(c["chat_id"], reset_text)
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+    cap_chats = await get_all_captain_chats()
+    for cc in cap_chats:
+        try:
+            await bot.send_message(cc["chat_id"], reset_text)
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+    # 2. Рассылка пользователям в ЛС
+    all_player_ids = await get_all_known_player_ids()
+    for tg_id in all_player_ids:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔗 Привязать SteamID", callback_data="profile:steamid")
+        try:
+            await bot.send_message(tg_id, reset_text, reply_markup=kb.as_markup())
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+
 # ---------- Капитанские чаты ----------
+
 @panel_router.callback_query(F.data == "adm:captains_menu")
 async def cb_captains_menu(call: CallbackQuery):
     caps = await get_all_captain_chats()
@@ -1064,6 +1237,7 @@ async def process_captain_chat_id(message: Message, state: FSMContext):
 
 
 # ---------- ИСКЛЮЧЕНИЯ (МУЛЬТИЧАТ) ----------
+
 @panel_router.callback_query(F.data == "adm:exceptions_menu")
 async def cb_exceptions_menu(call: CallbackQuery):
     await call.message.edit_text("🛡 <b>Управление исключениями (мультичат)</b>", reply_markup=exceptions_menu_kb())
@@ -1141,6 +1315,7 @@ async def cb_delete_exception(call: CallbackQuery):
 
 
 # ---------- РЕДАКТОР ПРОФИЛЯ ИГРОКА (АДМИН) ----------
+
 async def show_admin_player_card(message_or_call, tg_id: int):
     player = await get_player(tg_id)
     if not player:
@@ -1195,7 +1370,7 @@ async def cb_edit_p_nick_prompt(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminEditProfile.waiting_nickname)
     await call.message.edit_text(
         f"✏️ <b>Изменение Никнейма (TG ID: <code>{tg_id}</code>)</b>\n\n"
-        "Пришлите новый никнейм и номер (рекомендуется формат: <code>Nick #Number</code>):",
+        "Пришлите новый никнейм и номер (формат: <code>Nick #Number</code>):",
         reply_markup=back_to_menu_kb(),
     )
     await call.answer()
@@ -1241,6 +1416,10 @@ async def process_admin_set_steamid(message: Message, state: FSMContext, bot: Bo
         return
 
     new_steam = message.text.strip()
+    if not is_valid_steam_id(new_steam):
+        await message.answer("❌ Неверный формат SteamID! Не присылайте ссылки на steam. Попробуйте еще раз:")
+        return
+
     await set_player_steam(tg_id, new_steam)
     await state.clear()
     await sync_player_chats_and_team(bot, tg_id)
@@ -1279,7 +1458,8 @@ async def cb_edit_p_set_team(call: CallbackQuery):
     await show_admin_player_card(call, tg_id)
 
 
-# ---------- Добавление команды (с выбором RPL / FPHL) ----------
+# ---------- Добавление команды ----------
+
 @panel_router.callback_query(F.data == "adm:add_chat")
 async def cb_add_chat(call: CallbackQuery, state: FSMContext):
     await state.set_state(AddChat.waiting_league)
@@ -1338,6 +1518,7 @@ async def cb_list_chats(call: CallbackQuery):
 
 
 # ---------- Редактирование команды ----------
+
 @panel_router.callback_query(F.data == "adm:edit_chat")
 async def cb_edit_chat_list(call: CallbackQuery):
     chats = await get_chats()
@@ -1425,6 +1606,7 @@ async def process_edit_chat_emoji(message: Message, state: FSMContext, bot: Bot)
 
 
 # ---------- Добавление сервера ----------
+
 @panel_router.callback_query(F.data == "adm:add_server")
 async def cb_add_server(call: CallbackQuery, state: FSMContext):
     await state.set_state(AddServer.waiting_name)
@@ -1539,6 +1721,7 @@ async def cb_delete_server(call: CallbackQuery):
 
 
 # ---------- Добавление матча ----------
+
 @panel_router.callback_query(F.data == "adm:add_match")
 async def cb_add_match(call: CallbackQuery, state: FSMContext):
     chats = await get_chats()
@@ -1654,6 +1837,7 @@ async def cb_pick_server(call: CallbackQuery, state: FSMContext):
 
 
 # ---------- Список / удаление матчей ----------
+
 @panel_router.callback_query(F.data == "adm:list_matches")
 async def cb_list_matches(call: CallbackQuery):
     matches = await get_upcoming_matches()
@@ -1703,6 +1887,7 @@ async def cb_delete_match(call: CallbackQuery):
 
 
 # ---------- Привязка канала ----------
+
 @panel_router.callback_query(F.data == "adm:add_channel")
 async def cb_add_channel(call: CallbackQuery, state: FSMContext):
     await state.set_state(AddChannel.waiting_id)
@@ -1786,12 +1971,13 @@ async def cb_list_channels(call: CallbackQuery):
     await call.answer()
 
 
-# ---------- Бан игроков ----------
+# ---------- Раздельный бан игроков (RPL / FPHL / ALL) ----------
+
 @panel_router.callback_query(F.data == "adm:ban_player")
 async def cb_ban_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(BanPlayer.waiting_target)
     await call.message.edit_text(
-        "🚫 <b>Бан игрока</b>\n\nПришлите TG ID или @username игрока:",
+        "🚫 <b>Бан игрока</b>\n\n1️⃣ Пришлите TG ID или @username игрока:",
         reply_markup=back_to_menu_kb(),
     )
     await call.answer()
@@ -1816,22 +2002,32 @@ async def process_ban_target(message: Message, state: FSMContext):
         return
 
     await state.update_data(ban_target=target_id)
+    await state.set_state(BanPlayer.waiting_league)
+    await message.answer("2️⃣ Выберите лигу для блокировки:", reply_markup=ban_league_choice_kb())
+
+
+@panel_router.callback_query(BanPlayer.waiting_league, F.data.startswith("banleague:"))
+async def process_ban_league(call: CallbackQuery, state: FSMContext):
+    league = call.data.split(":")[1]
+    await state.update_data(ban_league=league)
     await state.set_state(BanPlayer.waiting_reason)
-    await message.answer("✏️ Укажите причину бана:")
+    await call.message.edit_text(f"Выбрана лига: <b>{league}</b>\n\n3️⃣ Укажите причину бана:")
+    await call.answer()
 
 
 @panel_router.message(BanPlayer.waiting_reason)
 async def process_ban_reason(message: Message, state: FSMContext):
     await state.update_data(ban_reason=message.text.strip())
     await state.set_state(BanPlayer.waiting_duration)
-    await message.answer("⏱ Выберите срок бана:", reply_markup=ban_duration_kb())
+    await message.answer("4️⃣ Выберите срок бана:", reply_markup=ban_duration_kb())
 
 
 @panel_router.callback_query(BanPlayer.waiting_duration, F.data.startswith("bandur:"))
-async def process_ban_duration(call: CallbackQuery, state: FSMContext):
+async def process_ban_duration(call: CallbackQuery, state: FSMContext, bot: Bot):
     days = int(call.data.split(":")[1])
     data = await state.get_data()
     target_id = data.get("ban_target")
+    league = data.get("ban_league", "ALL")
     reason = data.get("ban_reason", "не указана")
     if not target_id:
         await state.clear()
@@ -1840,12 +2036,27 @@ async def process_ban_duration(call: CallbackQuery, state: FSMContext):
         return
 
     until = None if days == 0 else datetime.now(timezone.utc) + timedelta(days=days)
-    await ban_player_db(target_id, reason, until)
+    await ban_player_db(target_id, league, reason, until)
     await state.clear()
 
     dur_text = "навсегда" if until is None else until.astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
+    
+    # Автоматическое уведомление забаненного игрока в ЛС
+    ban_notice = (
+        f"🚫 <b>Вы были забанены!</b>\n━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🛡 <b>Лига:</b> {league}\n"
+        f"✏️ <b>Причина:</b> {esc(reason)}\n"
+        f"⏱ <b>Срок бана:</b> {dur_text}\n\n"
+        f"<i>При возникновении вопросов обратитесь к администрации.</i>"
+    )
+    try:
+        await bot.send_message(target_id, ban_notice)
+    except Exception as e:
+        logging.warning(f"Не удалось отправить уведомление о бане пользователю {target_id}: {e}")
+
     await call.message.edit_text(
         f"✅ Игрок <code>{target_id}</code> забанен.\n"
+        f"Лига: <b>{league}</b>\n"
         f"Причина: {esc(reason)}\n"
         f"Срок: {dur_text}",
         reply_markup=admin_main_menu(),
@@ -1863,15 +2074,15 @@ async def cb_list_bans(call: CallbackQuery):
     lines = []
     for b in bans:
         until = "навсегда" if not b["until"] else b["until"].astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
-        lines.append(f"🚫 <code>{b['tg_id']}</code> — {esc(b['reason'])} (до {until})")
+        lines.append(f"🚫 #{b['id']} | ID: <code>{b['tg_id']}</code> [{b['league']}] — {esc(b['reason'])} (до {until})")
     await call.message.edit_text("📋 <b>Активные баны:</b>\n\n" + "\n".join(lines), reply_markup=bans_list_kb(bans))
     await call.answer()
 
 
 @panel_router.callback_query(F.data.startswith("adm:unban:"))
 async def cb_unban(call: CallbackQuery):
-    tg_id = int(call.data.split(":")[2])
-    await unban_player_db(tg_id)
+    ban_id = int(call.data.split(":")[2])
+    await unban_player_db(ban_id)
     await call.answer("✅ Игрок разбанен", show_alert=True)
     bans = await get_active_bans()
     if not bans:
@@ -1885,7 +2096,6 @@ async def cb_unban(call: CallbackQuery):
 # =========================================================
 
 async def sync_player_chats_and_team(bot: Bot, tg_id: int):
-    """Автоматически проверяет участие игрока во всех чатах лиги и обновляет его команду"""
     chats = await get_chats()
     for chat in chats:
         try:
@@ -1903,6 +2113,21 @@ async def sync_player_chats_and_team(bot: Bot, tg_id: int):
 async def dm_start(message: Message, bot: Bot):
     tg_id = message.from_user.id
     await upsert_player_basic(tg_id, message.from_user.username, message.from_user.full_name)
+
+    # Проверка бана при /start
+    active_ban = await get_active_ban(tg_id)
+    if active_ban:
+        until = "навсегда" if not active_ban["until"] else active_ban["until"].astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
+        ban_text = (
+            f"🚫 <b>У вас активный бан в лиге!</b>\n━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🛡 <b>Лига:</b> {active_ban['league']}\n"
+            f"✏️ <b>Причина:</b> {esc(active_ban['reason'])}\n"
+            f"⏱ <b>Срок бана:</b> {until}\n\n"
+            f"<i>Вы не можете пользоваться возможностями бота, пока действует бан.</i>"
+        )
+        await message.answer(ban_text)
+        return
+
     await sync_player_chats_and_team(bot, tg_id)
     player = await get_player(tg_id)
     text = await build_profile_text(player)
@@ -1960,17 +2185,20 @@ async def cb_profile_menu(call: CallbackQuery):
     await call.answer()
 
 
+# Привязка SteamID (Строго 1 раз, только SteamID, без ссылок)
 @dm_router.callback_query(F.data == "profile:steamid")
 async def cb_prompt_steamid(call: CallbackQuery, state: FSMContext):
     player = await get_player(call.from_user.id)
     if player and player["steam_id"]:
-        await call.answer("SteamID уже привязан и не подлежит изменению.", show_alert=True)
+        await call.answer("❌ Вы уже привязали SteamID! Повторная привязка запрещена.", show_alert=True)
         return
     await state.set_state(SetProfile.waiting_steamid)
     await call.message.answer(
         "🎮 <b>Привязка SteamID</b>\n\n"
-        "Отправьте ваш SteamID (например, <code>76561198000000000</code> или ссылку на профиль).\n\n"
-        "⚠️ <i>Привязать SteamID можно только один раз! Будьте внимательны.</i>"
+        "Отправьте ваш <b>SteamID</b> (например: <code>76561198000000000</code> или кастомный никнейм).\n\n"
+        "⚠️ <b>ВНИМАНИЕ:</b>\n"
+        "1. Отправлять нужно <b>ТОЛЬКО SteamID</b>, а не ссылку на профиль steam!\n"
+        "2. Привязать SteamID можно <b>ТОЛЬКО 1 РАЗ</b>! Будьте внимательны."
     )
     await call.answer()
 
@@ -1982,24 +2210,34 @@ async def process_set_steamid(message: Message, state: FSMContext, bot: Bot):
 
     if player and player["steam_id"]:
         await state.clear()
-        await message.answer("❌ SteamID уже привязан.", reply_markup=profile_menu_kb(player))
+        await message.answer("❌ SteamID уже привязан к вашему аккаунту и не подлежит изменению.", reply_markup=profile_menu_kb(player))
         return
 
     steam_id = message.text.strip()
+
+    # Проверка формата: НЕ ССЫЛКА, а именно SteamID
+    if not is_valid_steam_id(steam_id):
+        await message.answer(
+            "❌ <b>Некорректный формат SteamID!</b>\n\n"
+            "Не отправляйте ссылку на профиль Steam (например, <code>https://steamcommunity.com/...</code>).\n"
+            "Пришлите только сам <b>SteamID</b> (например: <code>76561198000000000</code>) или кастомный идентификатор:\n\n"
+            "Попробуйте ещё раз:"
+        )
+        return
+
     existing = await get_player_by_steam_id(steam_id)
     if existing and existing["tg_id"] != tg_id:
-        await message.answer("❌ Этот SteamID уже привязан к другому игроку! Пришлите ваш SteamID:")
+        await message.answer("❌ Этот SteamID уже занят другим игроком! Укажите ваш личный SteamID:")
         return
 
     await set_player_steam(tg_id, steam_id)
     await state.clear()
 
-    # Автоматически синхронизируем составы и добавляем игрока
     await sync_player_chats_and_team(bot, tg_id)
 
     player = await get_player(tg_id)
     text = await build_profile_text(player)
-    await message.answer("✅ <b>SteamID успешно привязан!</b> Вы автоматически добавлены в состав вашей команды.\n\n" + text, reply_markup=profile_menu_kb(player))
+    await message.answer("✅ <b>SteamID успешно привязан!</b> Вы привязали его окончательно.\n\n" + text, reply_markup=profile_menu_kb(player))
 
 
 @dm_router.callback_query(F.data == "profile:nickname")
@@ -2017,7 +2255,6 @@ async def cb_prompt_nickname(call: CallbackQuery, state: FSMContext):
 async def process_set_nickname(message: Message, state: FSMContext, bot: Bot):
     nickname = message.text.strip()
 
-    # Проверка строгого формата "Nick #123"
     if not NICKNAME_PATTERN.match(nickname):
         await message.answer(
             "❌ <b>Неверный формат никнейма!</b>\n\n"
@@ -2031,7 +2268,6 @@ async def process_set_nickname(message: Message, state: FSMContext, bot: Bot):
     await set_player_nickname(tg_id, nickname)
     await state.clear()
 
-    # Автоматическая синхронизация состава
     await sync_player_chats_and_team(bot, tg_id)
 
     player = await get_player(message.from_user.id)
@@ -2051,7 +2287,6 @@ async def build_roster_text(bot: Bot, chat) -> str:
             steam = esc(p["steam_id"]) if p["steam_id"] else "❌ Не привязан"
             user_tag = f"@{esc(p['username'])}" if p["username"] else "—"
 
-            # Проверка, является ли игрок капитаном
             is_cap = await is_player_captain(bot, p["tg_id"], league)
             cap_tag = " 👑 <b>(Капитан)</b>" if is_cap else ""
 
@@ -2120,7 +2355,7 @@ async def cb_choose_team(call: CallbackQuery, bot: Bot):
             await bot.ban_chat_member(chat_id, tg_id)
             await bot.unban_chat_member(chat_id, tg_id)
         except Exception as e:
-            logging.warning(f"Не удалось исключить игрока {tg_id} излишнего чата {chat_id}: {e}")
+            logging.warning(f"Не удалось исключить игрока {tg_id} из лишнего чата {chat_id}: {e}")
 
     await set_player_team(tg_id, chosen_chat_id)
     chat_info = await get_chat(chosen_chat_id)
@@ -2196,7 +2431,8 @@ async def team_chat_gate(message: Message, bot: Bot):
     if await is_chat_admin(bot, message.chat.id, tg_id):
         return
 
-    ban = await get_active_ban(tg_id)
+    # Быстрая проверка бана с учетом лиги текущего чата
+    ban = await get_active_ban(tg_id, chat["league"])
     if ban:
         try:
             await message.delete()
@@ -2205,7 +2441,7 @@ async def team_chat_gate(message: Message, bot: Bot):
         until = "навсегда" if not ban["until"] else ban["until"].astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
         await send_and_autodelete(
             bot, message.chat.id,
-            f"🚫 {full_name}, вы забанены в лиге.\nПричина: {esc(ban['reason'])}\nСрок: {until}",
+            f"🚫 {full_name}, вы забанены в лиге {ban['league']}.\nПричина: {esc(ban['reason'])}\nСрок: {until}",
         )
         return
 
@@ -2316,7 +2552,7 @@ async def sync_all_rosters(bot: Bot):
                 await remove_player_chat(tg_id, chat_id)
                 await recompute_player_team(bot, tg_id)
 
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.01)
 
 
 async def auto_roster_check_loop(bot: Bot):
