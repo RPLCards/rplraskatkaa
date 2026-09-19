@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import os
@@ -58,6 +59,7 @@ VPS_PORT = int(os.getenv("VPS_PORT", "22"))
 VPS_USER = os.getenv("VPS_USER", "root")
 VPS_PASSWORD = os.getenv("VPS_PASSWORD", "")
 VPS_KEY_PATH = os.getenv("VPS_KEY_PATH", "")
+VPS_KEY_CONTENT = os.getenv("VPS_KEY_CONTENT", "")
 PUCK_WHITELIST_PATH = os.getenv("PUCK_WHITELIST_PATH", "")
 PUCK_RESTART_CMD = os.getenv("PUCK_RESTART_CMD", "")
 
@@ -209,37 +211,70 @@ async def init_pool():
 #              СИНХРОНИЗАЦИЯ WHITELIST НА VPS (SSH)
 # =========================================================
 
-def _ssh_write_whitelist_sync(content: str) -> tuple[bool, str]:
-    """Синхронная запись файла whitelist на VPS через SSH + SFTP. Возвращает (успех, сообщение)."""
+_whitelist_lock = asyncio.Lock()
+
+
+def _build_ssh_client() -> tuple[paramiko.SSHClient | None, str]:
+    """Создаёт SSH-клиент и подключается. Возвращает (client, error_msg)."""
     if not VPS_HOST:
-        return False, "VPS_HOST не задан"
-    if not PUCK_WHITELIST_PATH:
-        return False, "PUCK_WHITELIST_PATH не задан"
+        return None, "VPS_HOST не задан"
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    connect_kwargs = {
+        "hostname": VPS_HOST,
+        "port": VPS_PORT,
+        "username": VPS_USER,
+        "timeout": 20,
+        "banner_timeout": 20,
+        "auth_timeout": 20,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+
     try:
-        connect_kwargs = {
-            "hostname": VPS_HOST,
-            "port": VPS_PORT,
-            "username": VPS_USER,
-            "timeout": 15,
-            "banner_timeout": 15,
-            "auth_timeout": 15,
-        }
-        if VPS_KEY_PATH and os.path.exists(VPS_KEY_PATH):
+        # Приоритет: ключ из переменной → ключ из файла → пароль
+        if VPS_KEY_CONTENT:
+            key_stream = io.StringIO(VPS_KEY_CONTENT.strip() + "\n")
+            pkey = None
+            for key_class in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey, paramiko.DSSKey):
+                try:
+                    key_stream.seek(0)
+                    pkey = key_class.from_private_key(key_stream)
+                    break
+                except Exception:
+                    continue
+            if pkey is None:
+                return None, "Не удалось распарсить приватный ключ из VPS_KEY_CONTENT"
+            connect_kwargs["pkey"] = pkey
+        elif VPS_KEY_PATH and os.path.exists(VPS_KEY_PATH):
             connect_kwargs["key_filename"] = VPS_KEY_PATH
-            connect_kwargs["look_for_keys"] = False
-            connect_kwargs["allow_agent"] = False
         elif VPS_PASSWORD:
             connect_kwargs["password"] = VPS_PASSWORD
-            connect_kwargs["look_for_keys"] = False
-            connect_kwargs["allow_agent"] = False
         else:
-            return False, "Не задан ни VPS_PASSWORD, ни VPS_KEY_PATH"
+            return None, "Не задан ни VPS_KEY_CONTENT, ни VPS_KEY_PATH, ни VPS_PASSWORD"
 
         client.connect(**connect_kwargs)
+        return client, ""
+    except Exception as e:
+        try:
+            client.close()
+        except Exception:
+            pass
+        return None, f"SSH ошибка: {e}"
 
+
+def _ssh_write_whitelist_sync(content: str) -> tuple[bool, str]:
+    """Синхронная запись файла whitelist на VPS через SSH + SFTP."""
+    if not PUCK_WHITELIST_PATH:
+        return False, "PUCK_WHITELIST_PATH не задан"
+
+    client, err = _build_ssh_client()
+    if client is None:
+        return False, err
+
+    try:
         sftp = client.open_sftp()
         try:
             with sftp.open(PUCK_WHITELIST_PATH, "w") as f:
@@ -252,12 +287,12 @@ def _ssh_write_whitelist_sync(content: str) -> tuple[bool, str]:
         if PUCK_RESTART_CMD:
             stdin, stdout, stderr = client.exec_command(PUCK_RESTART_CMD, timeout=30)
             out = stdout.read().decode(errors="ignore").strip()
-            err = stderr.read().decode(errors="ignore").strip()
-            msg += f" | Restart: {out or err or 'OK'}"
+            err_out = stderr.read().decode(errors="ignore").strip()
+            msg += f" | Restart: {out or err_out or 'OK'}"
 
         return True, msg
     except Exception as e:
-        return False, f"SSH ошибка: {e}"
+        return False, f"SFTP ошибка: {e}"
     finally:
         try:
             client.close()
@@ -267,45 +302,46 @@ def _ssh_write_whitelist_sync(content: str) -> tuple[bool, str]:
 
 async def rebuild_whitelist_file():
     """
-    Собирает SteamID игроков, которые:
-      - привязали SteamID
-      - состоят в команде (team_chat_id IS NOT NULL)
-      - не имеют активного бана
-    и пишет их в файл whitelist на VPS через SSH.
-    Формат файла: JSON-массив строк, каждая с новой строки.
+    Собирает SteamID игроков из БД и пишет их в файл whitelist на VPS через SSH.
+    Защищён локом — параллельные вызовы пропускаются.
     """
     if not VPS_HOST or not PUCK_WHITELIST_PATH:
         logging.debug("Whitelist не обновляется: VPS_HOST или PUCK_WHITELIST_PATH не заданы.")
         return
 
-    try:
-        async with _pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT DISTINCT p.steam_id
-                FROM players p
-                WHERE p.team_chat_id IS NOT NULL
-                  AND p.steam_id IS NOT NULL
-                  AND p.steam_id <> ''
-                  AND NOT EXISTS (
-                      SELECT 1 FROM bans b
-                      WHERE b.tg_id = p.tg_id
-                        AND (b.until IS NULL OR b.until > NOW())
-                  )
-                """
-            )
-        steam_ids = sorted({r["steam_id"] for r in rows})
+    if _whitelist_lock.locked():
+        logging.info("⏭ Whitelist уже обновляется — пропускаю повторный запуск.")
+        return
 
-        # 🔥 Формат: ["7656...", "7656...", ...] + перенос строки в конце
-        content = json.dumps(steam_ids, indent=2, ensure_ascii=False) + "\n"
+    async with _whitelist_lock:
+        try:
+            async with _pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT p.steam_id
+                    FROM players p
+                    WHERE p.team_chat_id IS NOT NULL
+                      AND p.steam_id IS NOT NULL
+                      AND p.steam_id <> ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM bans b
+                          WHERE b.tg_id = p.tg_id
+                            AND (b.until IS NULL OR b.until > NOW())
+                      )
+                    """
+                )
+            steam_ids = sorted({r["steam_id"] for r in rows})
 
-        ok, msg = await asyncio.to_thread(_ssh_write_whitelist_sync, content)
-        if ok:
-            logging.info(f"✅ Whitelist обновлён: {len(steam_ids)} SteamID. {msg}")
-        else:
-            logging.error(f"❌ Не удалось обновить whitelist: {msg}")
-    except Exception as e:
-        logging.error(f"❌ Ошибка rebuild_whitelist_file: {e}")
+            # Формат: ["7656...", "7656...", ...] + перенос строки в конце
+            content = json.dumps(steam_ids, indent=2, ensure_ascii=False) + "\n"
+
+            ok, msg = await asyncio.to_thread(_ssh_write_whitelist_sync, content)
+            if ok:
+                logging.info(f"✅ Whitelist обновлён: {len(steam_ids)} SteamID. {msg}")
+            else:
+                logging.error(f"❌ Не удалось обновить whitelist: {msg}")
+        except Exception as e:
+            logging.error(f"❌ Ошибка rebuild_whitelist_file: {e}")
 
 
 # =========================================================
@@ -562,14 +598,14 @@ async def get_player_by_steam_id(steam_id: str):
 async def set_player_steam(tg_id: int, steam_id: str):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET steam_id = $1 WHERE tg_id = $2", steam_id, tg_id)
-    # 🔥 Автообновление whitelist на VPS
-    await rebuild_whitelist_file()
+    # 🔥 Автообновление whitelist в фоне (не блокируем хэндлер)
+    asyncio.create_task(rebuild_whitelist_file())
 
 
 async def reset_all_players_steam_ids():
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET steam_id = NULL")
-    await rebuild_whitelist_file()
+    asyncio.create_task(rebuild_whitelist_file())
 
 
 async def set_player_nickname(tg_id: int, nickname: str):
@@ -578,12 +614,15 @@ async def set_player_nickname(tg_id: int, nickname: str):
 
 
 async def set_player_team(tg_id: int, chat_id: int | None):
+    changed = False
     async with _pool.acquire() as conn:
         old_player = await conn.fetchrow("SELECT team_chat_id FROM players WHERE tg_id = $1", tg_id)
         old_chat_id = old_player["team_chat_id"] if old_player else None
 
         if old_chat_id == chat_id:
             return
+
+        changed = True
 
         if old_chat_id:
             await conn.execute(
@@ -603,8 +642,9 @@ async def set_player_team(tg_id: int, chat_id: int | None):
                 )
 
         await conn.execute("UPDATE players SET team_chat_id = $1 WHERE tg_id = $2", chat_id, tg_id)
-    # 🔥 Автообновление whitelist на VPS
-    await rebuild_whitelist_file()
+
+    if changed:
+        asyncio.create_task(rebuild_whitelist_file())
 
 
 async def add_player_chat(tg_id: int, chat_id: int):
@@ -678,14 +718,13 @@ async def ban_player_db(tg_id: int, league: str, reason: str, until: datetime | 
             "INSERT INTO bans (tg_id, league, reason, until) VALUES ($1, $2, $3, $4)",
             tg_id, league, reason, until,
         )
-    # 🔥 Забаненный автоматически вылетает из whitelist
-    await rebuild_whitelist_file()
+    asyncio.create_task(rebuild_whitelist_file())
 
 
 async def unban_player_db(ban_id: int):
     async with _pool.acquire() as conn:
         await conn.execute("DELETE FROM bans WHERE id = $1", ban_id)
-    await rebuild_whitelist_file()
+    asyncio.create_task(rebuild_whitelist_file())
 
 
 async def get_active_ban(tg_id: int, league: str | None = None):
@@ -1221,14 +1260,13 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
 # 🔥 Ручное обновление whitelist из админки
 @panel_router.callback_query(F.data == "adm:rebuild_wl")
 async def cb_rebuild_whitelist(call: CallbackQuery):
-    await call.answer("⏳ Обновляю whitelist на VPS...", show_alert=False)
-    await rebuild_whitelist_file()
+    await call.answer("⏳ Обновляю whitelist в фоне...")
+    asyncio.create_task(rebuild_whitelist_file())
     await call.message.edit_text(
-        "✅ <b>Команда обновления whitelist выполнена.</b>\n"
-        "Проверь логи Railway (или VPS), чтобы убедиться в успехе.",
+        "✅ <b>Обновление whitelist запущено в фоне.</b>\n"
+        "Проверь логи Railway через 15–30 секунд, чтобы увидеть результат.",
         reply_markup=back_to_menu_kb(),
     )
-    await call.answer()
 
 
 # ---------- "Посмотреть всех игроков" & "Сбросить SteamID" ----------
@@ -1286,10 +1324,16 @@ async def cb_admin_reset_steam_confirm(call: CallbackQuery):
 
 @panel_router.callback_query(F.data == "adm:reset_steam_execute")
 async def cb_admin_reset_steam_execute(call: CallbackQuery, bot: Bot):
-    await reset_all_players_steam_ids()
-    await call.message.edit_text("✅ Все SteamID сброшены! Whitelist обновлён. Запущена рассылка...", reply_markup=back_to_menu_kb())
-    await call.answer()
+    async with _pool.acquire() as conn:
+        await conn.execute("UPDATE players SET steam_id = NULL")
 
+    asyncio.create_task(rebuild_whitelist_file())
+
+    await call.message.edit_text(
+        "✅ Все SteamID сброшены! Whitelist обновится в фоне. Запущена рассылка...",
+        reply_markup=back_to_menu_kb(),
+    )
+    await call.answer()
     asyncio.create_task(broadcast_steam_reset(bot))
 
 
@@ -2890,13 +2934,10 @@ async def main():
     await init_pool()
     logging.info("✅ База данных подключена и готова к работе")
 
-    # 🔥 Однократная синхронизация whitelist на старте
+    # Однократная синхронизация whitelist на старте (в фоне, чтобы не тормозить запуск)
     if VPS_HOST and PUCK_WHITELIST_PATH:
-        try:
-            await rebuild_whitelist_file()
-            logging.info("✅ Whitelist синхронизирован при старте бота")
-        except Exception as e:
-            logging.error(f"❌ Ошибка первичной синхронизации whitelist: {e}")
+        asyncio.create_task(rebuild_whitelist_file())
+        logging.info("✅ Запущена фоновая синхронизация whitelist при старте бота")
 
     asyncio.create_task(scheduler_loop(bot))
     logging.info("✅ Запущен планировщик напоминаний о матчах")
