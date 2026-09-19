@@ -1,5 +1,4 @@
 import asyncio
-import io
 import json
 import logging
 import os
@@ -8,8 +7,8 @@ from datetime import datetime, timezone, timedelta
 from html import escape
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import asyncpg
-import paramiko
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, Router, F
@@ -53,15 +52,9 @@ ADMIN_RIGHTS_CHECK_INTERVAL = 300  # 5 минут
 ROSTER_CHECK_INTERVAL = 300        # 5 минут
 STEAM_REMINDER_INTERVAL = 10800    # 3 часа
 
-# ---------- SSH / Puck Whitelist ----------
-VPS_HOST = os.getenv("VPS_HOST", "")
-VPS_PORT = int(os.getenv("VPS_PORT", "22"))
-VPS_USER = os.getenv("VPS_USER", "root")
-VPS_PASSWORD = os.getenv("VPS_PASSWORD", "")
-VPS_KEY_PATH = os.getenv("VPS_KEY_PATH", "")
-VPS_KEY_CONTENT = os.getenv("VPS_KEY_CONTENT", "")
-PUCK_WHITELIST_PATH = os.getenv("PUCK_WHITELIST_PATH", "")
-PUCK_RESTART_CMD = os.getenv("PUCK_RESTART_CMD", "")
+# ---------- HTTP-мост до VPS ----------
+WHITELIST_URL = os.getenv("WHITELIST_URL", "")
+WHITELIST_TOKEN = os.getenv("WHITELIST_TOKEN", "")
 
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -208,112 +201,41 @@ async def init_pool():
 
 
 # =========================================================
-#              СИНХРОНИЗАЦИЯ WHITELIST НА VPS (SSH)
+#              СИНХРОНИЗАЦИЯ WHITELIST (HTTP)
 # =========================================================
 
 _whitelist_lock = asyncio.Lock()
 
 
-def _build_ssh_client() -> tuple[paramiko.SSHClient | None, str]:
-    """Создаёт SSH-клиент и подключается. Возвращает (client, error_msg)."""
-    if not VPS_HOST:
-        return None, "VPS_HOST не задан"
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    connect_kwargs = {
-        "hostname": VPS_HOST,
-        "port": VPS_PORT,
-        "username": VPS_USER,
-        "timeout": 20,
-        "banner_timeout": 20,
-        "auth_timeout": 20,
-        "look_for_keys": False,
-        "allow_agent": False,
-    }
+async def _send_whitelist_http(steam_ids: list[str]) -> tuple[bool, str]:
+    """Отправляет whitelist на VPS через HTTP POST."""
+    if not WHITELIST_URL:
+        return False, "WHITELIST_URL не задан"
+    if not WHITELIST_TOKEN:
+        return False, "WHITELIST_TOKEN не задан"
 
     try:
-        # Приоритет: ключ из переменной → ключ из файла → пароль
-        if VPS_KEY_CONTENT:
-            # Поддержка ключа как с реальными переносами, так и с литеральными "\n"
-            key_content = VPS_KEY_CONTENT.strip().replace("\\n", "\n")
-            if not key_content.endswith("\n"):
-                key_content += "\n"
-
-            key_stream = io.StringIO(key_content)
-            pkey = None
-            last_err = None
-            for key_class in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey, paramiko.DSSKey):
-                try:
-                    key_stream.seek(0)
-                    pkey = key_class.from_private_key(key_stream)
-                    break
-                except Exception as e:
-                    last_err = e
-                    continue
-            if pkey is None:
-                return None, f"Не удалось распарсить приватный ключ из VPS_KEY_CONTENT: {last_err}"
-            connect_kwargs["pkey"] = pkey
-        elif VPS_KEY_PATH and os.path.exists(VPS_KEY_PATH):
-            connect_kwargs["key_filename"] = VPS_KEY_PATH
-        elif VPS_PASSWORD:
-            connect_kwargs["password"] = VPS_PASSWORD
-        else:
-            return None, "Не задан ни VPS_KEY_CONTENT, ни VPS_KEY_PATH, ни VPS_PASSWORD"
-
-        client.connect(**connect_kwargs)
-        return client, ""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                WHITELIST_URL,
+                json=steam_ids,
+                headers={"Authorization": f"Bearer {WHITELIST_TOKEN}"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                text = await resp.text()
+                if resp.status == 200:
+                    return True, f"HTTP 200, {len(steam_ids)} ID"
+                return False, f"HTTP {resp.status}: {text}"
+    except asyncio.TimeoutError:
+        return False, "HTTP timeout (30 сек)"
     except Exception as e:
-        try:
-            client.close()
-        except Exception:
-            pass
-        return None, f"SSH ошибка: {e}"
-
-
-def _ssh_write_whitelist_sync(content: str) -> tuple[bool, str]:
-    """Синхронная запись файла whitelist на VPS через SSH + SFTP."""
-    if not PUCK_WHITELIST_PATH:
-        return False, "PUCK_WHITELIST_PATH не задан"
-
-    client, err = _build_ssh_client()
-    if client is None:
-        return False, err
-
-    try:
-        sftp = client.open_sftp()
-        try:
-            with sftp.open(PUCK_WHITELIST_PATH, "w") as f:
-                f.write(content)
-        finally:
-            sftp.close()
-
-        msg = f"Файл записан ({len(content)} байт)"
-
-        if PUCK_RESTART_CMD:
-            stdin, stdout, stderr = client.exec_command(PUCK_RESTART_CMD, timeout=30)
-            out = stdout.read().decode(errors="ignore").strip()
-            err_out = stderr.read().decode(errors="ignore").strip()
-            msg += f" | Restart: {out or err_out or 'OK'}"
-
-        return True, msg
-    except Exception as e:
-        return False, f"SFTP ошибка: {e}"
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+        return False, f"HTTP ошибка: {e}"
 
 
 async def rebuild_whitelist_file():
-    """
-    Собирает SteamID игроков из БД и пишет их в файл whitelist на VPS через SSH.
-    Защищён локом — параллельные вызовы пропускаются.
-    """
-    if not VPS_HOST or not PUCK_WHITELIST_PATH:
-        logging.debug("Whitelist не обновляется: VPS_HOST или PUCK_WHITELIST_PATH не заданы.")
+    """Собирает SteamID из БД и отправляет их на VPS через HTTP."""
+    if not WHITELIST_URL:
+        logging.debug("WHITELIST_URL не задан — обновление whitelist пропущено.")
         return
 
     if _whitelist_lock.locked():
@@ -339,10 +261,7 @@ async def rebuild_whitelist_file():
                 )
             steam_ids = sorted({r["steam_id"] for r in rows})
 
-            # Формат: ["7656...", "7656...", ...] + перенос строки в конце
-            content = json.dumps(steam_ids, indent=2, ensure_ascii=False) + "\n"
-
-            ok, msg = await asyncio.to_thread(_ssh_write_whitelist_sync, content)
+            ok, msg = await _send_whitelist_http(steam_ids)
             if ok:
                 logging.info(f"✅ Whitelist обновлён: {len(steam_ids)} SteamID. {msg}")
             else:
@@ -605,7 +524,6 @@ async def get_player_by_steam_id(steam_id: str):
 async def set_player_steam(tg_id: int, steam_id: str):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET steam_id = $1 WHERE tg_id = $2", steam_id, tg_id)
-    # Автообновление whitelist в фоне (не блокируем хэндлер)
     asyncio.create_task(rebuild_whitelist_file())
 
 
@@ -1271,7 +1189,7 @@ async def cb_rebuild_whitelist(call: CallbackQuery):
     asyncio.create_task(rebuild_whitelist_file())
     await call.message.edit_text(
         "✅ <b>Обновление whitelist запущено в фоне.</b>\n"
-        "Проверь логи Railway через 15–30 секунд, чтобы увидеть результат.",
+        "Проверь логи Railway через 5–10 секунд, чтобы увидеть результат.",
         reply_markup=back_to_menu_kb(),
     )
 
@@ -2941,8 +2859,7 @@ async def main():
     await init_pool()
     logging.info("✅ База данных подключена и готова к работе")
 
-    # Однократная синхронизация whitelist на старте (в фоне, чтобы не тормозить запуск)
-    if VPS_HOST and PUCK_WHITELIST_PATH:
+    if WHITELIST_URL:
         asyncio.create_task(rebuild_whitelist_file())
         logging.info("✅ Запущена фоновая синхронизация whitelist при старте бота")
 
