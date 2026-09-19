@@ -7,10 +7,9 @@ from datetime import datetime, timezone, timedelta
 from html import escape
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import asyncpg
 from dotenv import load_dotenv
-
-from aiohttp import web
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
@@ -53,9 +52,10 @@ ADMIN_RIGHTS_CHECK_INTERVAL = 300
 ROSTER_CHECK_INTERVAL = 300
 STEAM_REMINDER_INTERVAL = 10800
 
-# ---------- HTTP endpoint для VPS ----------
-WHITELIST_PULL_TOKEN = os.getenv("WHITELIST_PULL_TOKEN", "")
-HTTP_PORT = int(os.getenv("PORT", "8080"))
+# ---------- GitHub Gist (whitelist transport) ----------
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GIST_ID = os.getenv("GIST_ID", "")
+GIST_FILENAME = "whitelist.json"
 
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -202,10 +202,14 @@ async def init_pool():
 
 
 # =========================================================
-#         HTTP-ENDPOINT ДЛЯ ПОЛУЧЕНИЯ WHITELIST (VPS → БОТ)
+#          GITHUB GIST (WHITELIST TRANSPORT ДЛЯ VPS)
 # =========================================================
 
+_whitelist_lock = asyncio.Lock()
+
+
 async def _get_whitelist_ids() -> list[str]:
+    """Собирает SteamID игроков, которые в команде и не забанены."""
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -224,32 +228,67 @@ async def _get_whitelist_ids() -> list[str]:
     return sorted({r["steam_id"] for r in rows})
 
 
-async def http_whitelist_handler(request: web.Request) -> web.Response:
-    token = request.query.get("token", "")
-    if not WHITELIST_PULL_TOKEN or token != WHITELIST_PULL_TOKEN:
-        return web.Response(status=403, text="forbidden")
+async def _push_to_gist(content: str) -> tuple[bool, str]:
+    """Отправляет whitelist в GitHub Gist через PATCH."""
+    if not GITHUB_TOKEN:
+        return False, "GITHUB_TOKEN не задан"
+    if not GIST_ID:
+        return False, "GIST_ID не задан"
+
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {
+        "files": {
+            GIST_FILENAME: {
+                "content": content
+            }
+        }
+    }
+
     try:
-        steam_ids = await _get_whitelist_ids()
-        return web.json_response(steam_ids)
+        async with aiohttp.ClientSession() as session:
+            async with session.patch(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                text = await resp.text()
+                if resp.status in (200, 201):
+                    return True, f"GitHub {resp.status}, {len(content)} байт"
+                return False, f"GitHub {resp.status}: {text[:300]}"
+    except asyncio.TimeoutError:
+        return False, "GitHub timeout (30 сек)"
     except Exception as e:
-        logging.error(f"❌ Ошибка обработки /whitelist.json: {e}")
-        return web.Response(status=500, text=f"error: {e}")
+        return False, f"GitHub ошибка: {e}"
 
 
-async def http_health_handler(request: web.Request) -> web.Response:
-    return web.Response(text="OK")
+async def rebuild_whitelist_file():
+    """Собирает SteamID из БД и пушит их в Gist."""
+    if not GITHUB_TOKEN or not GIST_ID:
+        logging.debug("GITHUB_TOKEN или GIST_ID не задан — обновление whitelist пропущено.")
+        return
 
+    if _whitelist_lock.locked():
+        logging.info("⏭ Whitelist уже обновляется — пропускаю повторный запуск.")
+        return
 
-async def start_http_server():
-    app = web.Application()
-    app.router.add_get("/whitelist.json", http_whitelist_handler)
-    app.router.add_get("/health", http_health_handler)
+    async with _whitelist_lock:
+        try:
+            steam_ids = await _get_whitelist_ids()
+            content = json.dumps(steam_ids, indent=2, ensure_ascii=False) + "\n"
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
-    await site.start()
-    logging.info(f"✅ HTTP-сервер запущен на порту {HTTP_PORT}")
+            ok, msg = await _push_to_gist(content)
+            if ok:
+                logging.info(f"✅ Whitelist обновлён: {len(steam_ids)} SteamID. {msg}")
+            else:
+                logging.error(f"❌ Не удалось обновить whitelist: {msg}")
+        except Exception as e:
+            logging.error(f"❌ Ошибка rebuild_whitelist_file: {e}")
 
 
 # =========================================================
@@ -500,11 +539,13 @@ async def get_player_by_steam_id(steam_id: str):
 async def set_player_steam(tg_id: int, steam_id: str):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET steam_id = $1 WHERE tg_id = $2", steam_id, tg_id)
+    asyncio.create_task(rebuild_whitelist_file())
 
 
 async def reset_all_players_steam_ids():
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET steam_id = NULL")
+    asyncio.create_task(rebuild_whitelist_file())
 
 
 async def set_player_nickname(tg_id: int, nickname: str):
@@ -513,12 +554,15 @@ async def set_player_nickname(tg_id: int, nickname: str):
 
 
 async def set_player_team(tg_id: int, chat_id: int | None):
+    changed = False
     async with _pool.acquire() as conn:
         old_player = await conn.fetchrow("SELECT team_chat_id FROM players WHERE tg_id = $1", tg_id)
         old_chat_id = old_player["team_chat_id"] if old_player else None
 
         if old_chat_id == chat_id:
             return
+
+        changed = True
 
         if old_chat_id:
             await conn.execute(
@@ -538,6 +582,9 @@ async def set_player_team(tg_id: int, chat_id: int | None):
                 )
 
         await conn.execute("UPDATE players SET team_chat_id = $1 WHERE tg_id = $2", chat_id, tg_id)
+
+    if changed:
+        asyncio.create_task(rebuild_whitelist_file())
 
 
 async def add_player_chat(tg_id: int, chat_id: int):
@@ -609,11 +656,13 @@ async def ban_player_db(tg_id: int, league: str, reason: str, until: datetime | 
             "INSERT INTO bans (tg_id, league, reason, until) VALUES ($1, $2, $3, $4)",
             tg_id, league, reason, until,
         )
+    asyncio.create_task(rebuild_whitelist_file())
 
 
 async def unban_player_db(ban_id: int):
     async with _pool.acquire() as conn:
         await conn.execute("DELETE FROM bans WHERE id = $1", ban_id)
+    asyncio.create_task(rebuild_whitelist_file())
 
 
 async def get_active_ban(tg_id: int, league: str | None = None):
@@ -815,6 +864,7 @@ def admin_main_menu() -> InlineKeyboardMarkup:
     kb.button(text="🚫 Забанить игрока", callback_data="adm:ban_player")
     kb.button(text="📋 Список банов", callback_data="adm:list_bans")
     kb.button(text="🔄 Сбросить всем SteamID", callback_data="adm:reset_steam_confirm")
+    kb.button(text="🔁 Обновить whitelist", callback_data="adm:rebuild_wl")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -1139,6 +1189,17 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@panel_router.callback_query(F.data == "adm:rebuild_wl")
+async def cb_rebuild_whitelist(call: CallbackQuery):
+    await call.answer("⏳ Обновляю whitelist в фоне...")
+    asyncio.create_task(rebuild_whitelist_file())
+    await call.message.edit_text(
+        "✅ <b>Обновление whitelist запущено в фоне.</b>\n"
+        "Проверь логи Railway через 5–10 секунд, чтобы увидеть результат.",
+        reply_markup=back_to_menu_kb(),
+    )
+
+
 @panel_router.callback_query(F.data.startswith("adm:all_players:"))
 async def cb_admin_all_players(call: CallbackQuery):
     page = int(call.data.split(":")[2])
@@ -1195,8 +1256,10 @@ async def cb_admin_reset_steam_execute(call: CallbackQuery, bot: Bot):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET steam_id = NULL")
 
+    asyncio.create_task(rebuild_whitelist_file())
+
     await call.message.edit_text(
-        "✅ Все SteamID сброшены! VPS подхватит обновление в течение 30 секунд. Запущена рассылка...",
+        "✅ Все SteamID сброшены! Whitelist обновится в фоне. Запущена рассылка...",
         reply_markup=back_to_menu_kb(),
     )
     await call.answer()
@@ -1465,7 +1528,7 @@ async def process_admin_set_steamid(message: Message, state: FSMContext, bot: Bo
     await set_player_steam(tg_id, new_steam)
     await state.clear()
     await sync_player_chats_and_team(bot, tg_id)
-    await message.answer("✅ SteamID игрока обновлён! VPS подхватит обновление в течение 30 секунд.")
+    await message.answer("✅ SteamID игрока обновлён! VPS подхватит обновление в течение ~30 секунд.")
     await show_admin_player_card(message, tg_id)
 
 
@@ -2110,7 +2173,7 @@ async def cb_list_bans(call: CallbackQuery):
 async def cb_unban(call: CallbackQuery):
     ban_id = int(call.data.split(":")[2])
     await unban_player_db(ban_id)
-    await call.answer("✅ Игрок разбанен (обновится в течение 30 секунд)", show_alert=True)
+    await call.answer("✅ Игрок разбанен (обновится в течение ~30 секунд)", show_alert=True)
     bans = await get_active_bans()
     if not bans:
         await call.message.edit_text("📋 Активных банов нет.", reply_markup=back_to_menu_kb())
@@ -2261,7 +2324,7 @@ async def process_set_steamid(message: Message, state: FSMContext, bot: Bot):
 
     player = await get_player(tg_id)
     text = await build_profile_text(player)
-    await message.answer("✅ <b>SteamID успешно привязан!</b> VPS подхватит обновление в течение 30 секунд.\n\n" + text, reply_markup=profile_menu_kb(player))
+    await message.answer("✅ <b>SteamID успешно привязан!</b> VPS подхватит обновление в течение ~30 секунд.\n\n" + text, reply_markup=profile_menu_kb(player))
 
 
 @dm_router.callback_query(F.data == "profile:nickname")
@@ -2780,8 +2843,10 @@ async def main():
     await init_pool()
     logging.info("✅ База данных подключена и готова к работе")
 
-    # Запускаем HTTP-сервер для VPS
-    await start_http_server()
+    # Однократная синхронизация whitelist при старте
+    if GITHUB_TOKEN and GIST_ID:
+        asyncio.create_task(rebuild_whitelist_file())
+        logging.info("✅ Запущена фоновая синхронизация whitelist при старте бота")
 
     asyncio.create_task(scheduler_loop(bot))
     logging.info("✅ Запущен планировщик напоминаний о матчах")
