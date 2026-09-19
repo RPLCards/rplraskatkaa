@@ -236,17 +236,24 @@ def _build_ssh_client() -> tuple[paramiko.SSHClient | None, str]:
     try:
         # Приоритет: ключ из переменной → ключ из файла → пароль
         if VPS_KEY_CONTENT:
-            key_stream = io.StringIO(VPS_KEY_CONTENT.strip() + "\n")
+            # Поддержка ключа как с реальными переносами, так и с литеральными "\n"
+            key_content = VPS_KEY_CONTENT.strip().replace("\\n", "\n")
+            if not key_content.endswith("\n"):
+                key_content += "\n"
+
+            key_stream = io.StringIO(key_content)
             pkey = None
+            last_err = None
             for key_class in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey, paramiko.DSSKey):
                 try:
                     key_stream.seek(0)
                     pkey = key_class.from_private_key(key_stream)
                     break
-                except Exception:
+                except Exception as e:
+                    last_err = e
                     continue
             if pkey is None:
-                return None, "Не удалось распарсить приватный ключ из VPS_KEY_CONTENT"
+                return None, f"Не удалось распарсить приватный ключ из VPS_KEY_CONTENT: {last_err}"
             connect_kwargs["pkey"] = pkey
         elif VPS_KEY_PATH and os.path.exists(VPS_KEY_PATH):
             connect_kwargs["key_filename"] = VPS_KEY_PATH
@@ -598,7 +605,7 @@ async def get_player_by_steam_id(steam_id: str):
 async def set_player_steam(tg_id: int, steam_id: str):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET steam_id = $1 WHERE tg_id = $2", steam_id, tg_id)
-    # 🔥 Автообновление whitelist в фоне (не блокируем хэндлер)
+    # Автообновление whitelist в фоне (не блокируем хэндлер)
     asyncio.create_task(rebuild_whitelist_file())
 
 
@@ -1257,7 +1264,7 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# 🔥 Ручное обновление whitelist из админки
+# Ручное обновление whitelist из админки
 @panel_router.callback_query(F.data == "adm:rebuild_wl")
 async def cb_rebuild_whitelist(call: CallbackQuery):
     await call.answer("⏳ Обновляю whitelist в фоне...")
