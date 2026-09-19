@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -7,6 +8,7 @@ from html import escape
 from zoneinfo import ZoneInfo
 
 import asyncpg
+import paramiko
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, Router, F
@@ -50,17 +52,24 @@ ADMIN_RIGHTS_CHECK_INTERVAL = 300  # 5 минут
 ROSTER_CHECK_INTERVAL = 300        # 5 минут
 STEAM_REMINDER_INTERVAL = 10800    # 3 часа
 
+# ---------- SSH / Puck Whitelist ----------
+VPS_HOST = os.getenv("VPS_HOST", "")
+VPS_PORT = int(os.getenv("VPS_PORT", "22"))
+VPS_USER = os.getenv("VPS_USER", "root")
+VPS_PASSWORD = os.getenv("VPS_PASSWORD", "")
+VPS_KEY_PATH = os.getenv("VPS_KEY_PATH", "")
+PUCK_WHITELIST_PATH = os.getenv("PUCK_WHITELIST_PATH", "")
+PUCK_RESTART_CMD = os.getenv("PUCK_RESTART_CMD", "")
+
 MSK = ZoneInfo("Europe/Moscow")
 
-# Регулярное выражение для никнейма: "Nick #Number" (например: Ovechkin #8)
 NICKNAME_PATTERN = re.compile(r"^.+\s+#\d+$")
 
-# Проверка корректности SteamID (ТОЛЬКО SteamID/кастомный ID, без ссылок и доменов)
+
 def is_valid_steam_id(raw_input: str) -> bool:
     s = raw_input.strip()
     if any(bad in s.lower() for bad in ["http://", "https://", "steamcommunity.com", "/", "\\", "?", "#"]):
         return False
-    # Подходит под SteamID64, STEAM_0:..., [U:1:...], или кастомный vanity ID (буквы, цифры, _, -)
     pattern = re.compile(r"^(7656\d{13}|STEAM_[0-5]:[0-1]:\d+|\[U:[0-1]:\d+\]|[a-zA-Z0-9_\-]{3,32})$")
     return bool(pattern.match(s))
 
@@ -176,7 +185,6 @@ async def init_pool():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
-            -- Индексы для оптимизации скорости ответов бота
             CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_chat_id);
             CREATE INDEX IF NOT EXISTS idx_bans_tg_id ON bans(tg_id);
             CREATE INDEX IF NOT EXISTS idx_player_chats_tg ON player_chats(tg_id);
@@ -196,6 +204,113 @@ async def init_pool():
             except Exception as e:
                 logging.debug(f"Миграция (ALTER): {e}")
 
+
+# =========================================================
+#              СИНХРОНИЗАЦИЯ WHITELIST НА VPS (SSH)
+# =========================================================
+
+def _ssh_write_whitelist_sync(content: str) -> tuple[bool, str]:
+    """Синхронная запись файла whitelist на VPS через SSH + SFTP. Возвращает (успех, сообщение)."""
+    if not VPS_HOST:
+        return False, "VPS_HOST не задан"
+    if not PUCK_WHITELIST_PATH:
+        return False, "PUCK_WHITELIST_PATH не задан"
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        connect_kwargs = {
+            "hostname": VPS_HOST,
+            "port": VPS_PORT,
+            "username": VPS_USER,
+            "timeout": 15,
+            "banner_timeout": 15,
+            "auth_timeout": 15,
+        }
+        if VPS_KEY_PATH and os.path.exists(VPS_KEY_PATH):
+            connect_kwargs["key_filename"] = VPS_KEY_PATH
+            connect_kwargs["look_for_keys"] = False
+            connect_kwargs["allow_agent"] = False
+        elif VPS_PASSWORD:
+            connect_kwargs["password"] = VPS_PASSWORD
+            connect_kwargs["look_for_keys"] = False
+            connect_kwargs["allow_agent"] = False
+        else:
+            return False, "Не задан ни VPS_PASSWORD, ни VPS_KEY_PATH"
+
+        client.connect(**connect_kwargs)
+
+        sftp = client.open_sftp()
+        try:
+            with sftp.open(PUCK_WHITELIST_PATH, "w") as f:
+                f.write(content)
+        finally:
+            sftp.close()
+
+        msg = f"Файл записан ({len(content)} байт)"
+
+        if PUCK_RESTART_CMD:
+            stdin, stdout, stderr = client.exec_command(PUCK_RESTART_CMD, timeout=30)
+            out = stdout.read().decode(errors="ignore").strip()
+            err = stderr.read().decode(errors="ignore").strip()
+            msg += f" | Restart: {out or err or 'OK'}"
+
+        return True, msg
+    except Exception as e:
+        return False, f"SSH ошибка: {e}"
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+async def rebuild_whitelist_file():
+    """
+    Собирает SteamID игроков, которые:
+      - привязали SteamID
+      - состоят в команде (team_chat_id IS NOT NULL)
+      - не имеют активного бана
+    и пишет их в файл whitelist на VPS через SSH.
+    Формат файла: JSON-массив строк, каждая с новой строки.
+    """
+    if not VPS_HOST or not PUCK_WHITELIST_PATH:
+        logging.debug("Whitelist не обновляется: VPS_HOST или PUCK_WHITELIST_PATH не заданы.")
+        return
+
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT p.steam_id
+                FROM players p
+                WHERE p.team_chat_id IS NOT NULL
+                  AND p.steam_id IS NOT NULL
+                  AND p.steam_id <> ''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM bans b
+                      WHERE b.tg_id = p.tg_id
+                        AND (b.until IS NULL OR b.until > NOW())
+                  )
+                """
+            )
+        steam_ids = sorted({r["steam_id"] for r in rows})
+
+        # 🔥 Формат: ["7656...", "7656...", ...] + перенос строки в конце
+        content = json.dumps(steam_ids, indent=2, ensure_ascii=False) + "\n"
+
+        ok, msg = await asyncio.to_thread(_ssh_write_whitelist_sync, content)
+        if ok:
+            logging.info(f"✅ Whitelist обновлён: {len(steam_ids)} SteamID. {msg}")
+        else:
+            logging.error(f"❌ Не удалось обновить whitelist: {msg}")
+    except Exception as e:
+        logging.error(f"❌ Ошибка rebuild_whitelist_file: {e}")
+
+
+# =========================================================
+#                   ФУНКЦИИ БАЗЫ ДАННЫХ
+# =========================================================
 
 async def add_chat(chat_id: int, name: str, league: str):
     async with _pool.acquire() as conn:
@@ -283,6 +398,11 @@ async def add_channel(channel_id: int, title: str):
 async def get_channels():
     async with _pool.acquire() as conn:
         return await conn.fetch("SELECT * FROM channels ORDER BY title")
+
+
+async def get_channel(channel_id: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM channels WHERE channel_id = $1", channel_id)
 
 
 async def link_channel_chat(channel_id: int, chat_id: int):
@@ -442,11 +562,14 @@ async def get_player_by_steam_id(steam_id: str):
 async def set_player_steam(tg_id: int, steam_id: str):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET steam_id = $1 WHERE tg_id = $2", steam_id, tg_id)
+    # 🔥 Автообновление whitelist на VPS
+    await rebuild_whitelist_file()
 
 
 async def reset_all_players_steam_ids():
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET steam_id = NULL")
+    await rebuild_whitelist_file()
 
 
 async def set_player_nickname(tg_id: int, nickname: str):
@@ -480,6 +603,8 @@ async def set_player_team(tg_id: int, chat_id: int | None):
                 )
 
         await conn.execute("UPDATE players SET team_chat_id = $1 WHERE tg_id = $2", chat_id, tg_id)
+    # 🔥 Автообновление whitelist на VPS
+    await rebuild_whitelist_file()
 
 
 async def add_player_chat(tg_id: int, chat_id: int):
@@ -525,7 +650,6 @@ async def get_unlinked_steam_in_teams() -> list[dict]:
         )
 
 
-# ФИКС ИСКЛЮЧЕНИЙ: Состав отображается СТРОГО по заданной в профиле команде (team_chat_id)
 async def get_team_roster(chat_id: int):
     async with _pool.acquire() as conn:
         return await conn.fetch(
@@ -554,11 +678,14 @@ async def ban_player_db(tg_id: int, league: str, reason: str, until: datetime | 
             "INSERT INTO bans (tg_id, league, reason, until) VALUES ($1, $2, $3, $4)",
             tg_id, league, reason, until,
         )
+    # 🔥 Забаненный автоматически вылетает из whitelist
+    await rebuild_whitelist_file()
 
 
 async def unban_player_db(ban_id: int):
     async with _pool.acquire() as conn:
         await conn.execute("DELETE FROM bans WHERE id = $1", ban_id)
+    await rebuild_whitelist_file()
 
 
 async def get_active_ban(tg_id: int, league: str | None = None):
@@ -762,6 +889,7 @@ def admin_main_menu() -> InlineKeyboardMarkup:
     kb.button(text="🚫 Забанить игрока", callback_data="adm:ban_player")
     kb.button(text="📋 Список банов", callback_data="adm:list_bans")
     kb.button(text="🔄 Сбросить всем SteamID", callback_data="adm:reset_steam_confirm")
+    kb.button(text="🔁 Обновить whitelist", callback_data="adm:rebuild_wl")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -1090,6 +1218,19 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+# 🔥 Ручное обновление whitelist из админки
+@panel_router.callback_query(F.data == "adm:rebuild_wl")
+async def cb_rebuild_whitelist(call: CallbackQuery):
+    await call.answer("⏳ Обновляю whitelist на VPS...", show_alert=False)
+    await rebuild_whitelist_file()
+    await call.message.edit_text(
+        "✅ <b>Команда обновления whitelist выполнена.</b>\n"
+        "Проверь логи Railway (или VPS), чтобы убедиться в успехе.",
+        reply_markup=back_to_menu_kb(),
+    )
+    await call.answer()
+
+
 # ---------- "Посмотреть всех игроков" & "Сбросить SteamID" ----------
 
 @panel_router.callback_query(F.data.startswith("adm:all_players:"))
@@ -1146,10 +1287,9 @@ async def cb_admin_reset_steam_confirm(call: CallbackQuery):
 @panel_router.callback_query(F.data == "adm:reset_steam_execute")
 async def cb_admin_reset_steam_execute(call: CallbackQuery, bot: Bot):
     await reset_all_players_steam_ids()
-    await call.message.edit_text("✅ Все SteamID сброшены! Запущена рассылка везде (кроме каналов)...", reply_markup=back_to_menu_kb())
+    await call.message.edit_text("✅ Все SteamID сброшены! Whitelist обновлён. Запущена рассылка...", reply_markup=back_to_menu_kb())
     await call.answer()
 
-    # Фоновая рассылка всем пользователям в ЛС и во все командные чаты
     asyncio.create_task(broadcast_steam_reset(bot))
 
 
@@ -1160,7 +1300,6 @@ async def broadcast_steam_reset(bot: Bot):
         "Пожалуйста, зайдите в личные сообщения бота и привяжите ваш <b>SteamID</b> заново!"
     )
 
-    # 1. Рассылка во все командные и капитанские чаты
     chats = await get_chats()
     for c in chats:
         try:
@@ -1177,7 +1316,6 @@ async def broadcast_steam_reset(bot: Bot):
         except Exception:
             pass
 
-    # 2. Рассылка пользователям в ЛС
     all_player_ids = await get_all_known_player_ids()
     for tg_id in all_player_ids:
         kb = InlineKeyboardBuilder()
@@ -1423,7 +1561,7 @@ async def process_admin_set_steamid(message: Message, state: FSMContext, bot: Bo
     await set_player_steam(tg_id, new_steam)
     await state.clear()
     await sync_player_chats_and_team(bot, tg_id)
-    await message.answer("✅ SteamID игрока обновлён!")
+    await message.answer("✅ SteamID игрока обновлён (whitelist перестроен)!")
     await show_admin_player_card(message, tg_id)
 
 
@@ -2040,8 +2178,7 @@ async def process_ban_duration(call: CallbackQuery, state: FSMContext, bot: Bot)
     await state.clear()
 
     dur_text = "навсегда" if until is None else until.astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
-    
-    # Автоматическое уведомление забаненного игрока в ЛС
+
     ban_notice = (
         f"🚫 <b>Вы были забанены!</b>\n━━━━━━━━━━━━━━━━━━━\n\n"
         f"🛡 <b>Лига:</b> {league}\n"
@@ -2083,7 +2220,7 @@ async def cb_list_bans(call: CallbackQuery):
 async def cb_unban(call: CallbackQuery):
     ban_id = int(call.data.split(":")[2])
     await unban_player_db(ban_id)
-    await call.answer("✅ Игрок разбанен", show_alert=True)
+    await call.answer("✅ Игрок разбанен (whitelist обновлён)", show_alert=True)
     bans = await get_active_bans()
     if not bans:
         await call.message.edit_text("📋 Активных банов нет.", reply_markup=back_to_menu_kb())
@@ -2114,7 +2251,6 @@ async def dm_start(message: Message, bot: Bot):
     tg_id = message.from_user.id
     await upsert_player_basic(tg_id, message.from_user.username, message.from_user.full_name)
 
-    # Проверка бана при /start
     active_ban = await get_active_ban(tg_id)
     if active_ban:
         until = "навсегда" if not active_ban["until"] else active_ban["until"].astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
@@ -2185,7 +2321,6 @@ async def cb_profile_menu(call: CallbackQuery):
     await call.answer()
 
 
-# Привязка SteamID (Строго 1 раз, только SteamID, без ссылок)
 @dm_router.callback_query(F.data == "profile:steamid")
 async def cb_prompt_steamid(call: CallbackQuery, state: FSMContext):
     player = await get_player(call.from_user.id)
@@ -2215,7 +2350,6 @@ async def process_set_steamid(message: Message, state: FSMContext, bot: Bot):
 
     steam_id = message.text.strip()
 
-    # Проверка формата: НЕ ССЫЛКА, а именно SteamID
     if not is_valid_steam_id(steam_id):
         await message.answer(
             "❌ <b>Некорректный формат SteamID!</b>\n\n"
@@ -2355,7 +2489,7 @@ async def cb_choose_team(call: CallbackQuery, bot: Bot):
             await bot.ban_chat_member(chat_id, tg_id)
             await bot.unban_chat_member(chat_id, tg_id)
         except Exception as e:
-            logging.warning(f"Не удалось исключить игрока {tg_id} из лишнего чата {chat_id}: {e}")
+            logging.warning(f"Не удалось исключить игрока {tg_id} излишнего чата {chat_id}: {e}")
 
     await set_player_team(tg_id, chosen_chat_id)
     chat_info = await get_chat(chosen_chat_id)
@@ -2431,7 +2565,6 @@ async def team_chat_gate(message: Message, bot: Bot):
     if await is_chat_admin(bot, message.chat.id, tg_id):
         return
 
-    # Быстрая проверка бана с учетом лиги текущего чата
     ban = await get_active_ban(tg_id, chat["league"])
     if ban:
         try:
@@ -2757,7 +2890,14 @@ async def main():
     await init_pool()
     logging.info("✅ База данных подключена и готова к работе")
 
-    # Фоновые сервисы
+    # 🔥 Однократная синхронизация whitelist на старте
+    if VPS_HOST and PUCK_WHITELIST_PATH:
+        try:
+            await rebuild_whitelist_file()
+            logging.info("✅ Whitelist синхронизирован при старте бота")
+        except Exception as e:
+            logging.error(f"❌ Ошибка первичной синхронизации whitelist: {e}")
+
     asyncio.create_task(scheduler_loop(bot))
     logging.info("✅ Запущен планировщик напоминаний о матчах")
 
