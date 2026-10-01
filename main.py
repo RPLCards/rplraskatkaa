@@ -181,6 +181,27 @@ async def init_pool():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
+            CREATE TABLE IF NOT EXISTS captain_recruitments (
+                id SERIAL PRIMARY KEY,
+                channel_username TEXT NOT NULL,
+                season TEXT NOT NULL,
+                is_open BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS captain_applications (
+                id SERIAL PRIMARY KEY,
+                tg_id BIGINT UNIQUE NOT NULL,
+                username TEXT,
+                full_name TEXT NOT NULL,
+                season TEXT NOT NULL,
+                team_name TEXT NOT NULL,
+                experience TEXT NOT NULL,
+                info TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
             CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_chat_id);
             CREATE INDEX IF NOT EXISTS idx_bans_tg_id ON bans(tg_id);
             CREATE INDEX IF NOT EXISTS idx_player_chats_tg ON player_chats(tg_id);
@@ -209,7 +230,6 @@ _whitelist_lock = asyncio.Lock()
 
 
 async def _get_whitelist_ids() -> list[str]:
-    """Собирает SteamID игроков, которые в команде и не забанены."""
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -229,11 +249,8 @@ async def _get_whitelist_ids() -> list[str]:
 
 
 async def _push_to_gist(content: str) -> tuple[bool, str]:
-    """Отправляет whitelist в GitHub Gist через PATCH."""
-    if not GITHUB_TOKEN:
-        return False, "GITHUB_TOKEN не задан"
-    if not GIST_ID:
-        return False, "GIST_ID не задан"
+    if not GITHUB_TOKEN or not GIST_ID:
+        return False, "GITHUB_TOKEN или GIST_ID не задан"
 
     url = f"https://api.github.com/gists/{GIST_ID}"
     headers = {
@@ -241,21 +258,12 @@ async def _push_to_gist(content: str) -> tuple[bool, str]:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    payload = {
-        "files": {
-            GIST_FILENAME: {
-                "content": content
-            }
-        }
-    }
+    payload = {"files": {GIST_FILENAME: {"content": content}}}
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.patch(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
+                url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
             ) as resp:
                 text = await resp.text()
                 if resp.status in (200, 201):
@@ -268,7 +276,6 @@ async def _push_to_gist(content: str) -> tuple[bool, str]:
 
 
 async def rebuild_whitelist_file():
-    """Собирает SteamID из БД и пушит их в Gist."""
     if not GITHUB_TOKEN or not GIST_ID:
         logging.debug("GITHUB_TOKEN или GIST_ID не задан — обновление whitelist пропущено.")
         return
@@ -281,7 +288,6 @@ async def rebuild_whitelist_file():
         try:
             steam_ids = await _get_whitelist_ids()
             content = json.dumps(steam_ids, indent=2, ensure_ascii=False) + "\n"
-
             ok, msg = await _push_to_gist(content)
             if ok:
                 logging.info(f"✅ Whitelist обновлён: {len(steam_ids)} SteamID. {msg}")
@@ -542,12 +548,6 @@ async def set_player_steam(tg_id: int, steam_id: str):
     asyncio.create_task(rebuild_whitelist_file())
 
 
-async def reset_all_players_steam_ids():
-    async with _pool.acquire() as conn:
-        await conn.execute("UPDATE players SET steam_id = NULL")
-    asyncio.create_task(rebuild_whitelist_file())
-
-
 async def set_player_nickname(tg_id: int, nickname: str):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE players SET nickname = $1 WHERE tg_id = $2", nickname, tg_id)
@@ -723,6 +723,79 @@ async def get_exceptions():
             """
         )
 
+# ---------- НАБОР И ЗАЯВКИ КАПИТАНОВ ----------
+
+async def create_recruitment(channel_username: str, season: str):
+    clean_chan = channel_username.strip()
+    if not clean_chan.startswith("@"):
+        clean_chan = f"@{clean_chan}"
+    async with _pool.acquire() as conn:
+        await conn.execute("UPDATE captain_recruitments SET is_open = FALSE")
+        return await conn.fetchrow(
+            """
+            INSERT INTO captain_recruitments (channel_username, season, is_open)
+            VALUES ($1, $2, TRUE) RETURNING *
+            """,
+            clean_chan, season.strip(),
+        )
+
+
+async def get_active_recruitment():
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT * FROM captain_recruitments WHERE is_open = TRUE ORDER BY id DESC LIMIT 1"
+        )
+
+
+async def save_captain_application(tg_id: int, username: str | None, full_name: str, season: str, team_name: str, experience: str, info: str):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            INSERT INTO captain_applications (tg_id, username, full_name, season, team_name, experience, info)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (tg_id) DO UPDATE SET
+                username = EXCLUDED.username,
+                full_name = EXCLUDED.full_name,
+                season = EXCLUDED.season,
+                team_name = EXCLUDED.team_name,
+                experience = EXCLUDED.experience,
+                info = EXCLUDED.info,
+                updated_at = NOW()
+            RETURNING *
+            """,
+            tg_id, username, full_name, season, team_name, experience, info,
+        )
+
+
+async def get_captain_application(tg_id: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM captain_applications WHERE tg_id = $1", tg_id)
+
+
+async def delete_captain_application(tg_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM captain_applications WHERE tg_id = $1", tg_id)
+
+
+async def get_all_captain_applications(limit: int = 20, offset: int = 0):
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM captain_applications ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            limit, offset,
+        )
+        total = await conn.fetchval("SELECT COUNT(*) FROM captain_applications")
+        return rows, total
+
+
+async def get_captain_application_by_id(app_id: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM captain_applications WHERE id = $1", app_id)
+
+
+async def delete_captain_application_by_id(app_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM captain_applications WHERE id = $1", app_id)
+
 
 # =========================================================
 #                    ТЕКСТЫ СООБЩЕНИЙ
@@ -776,7 +849,7 @@ async def build_profile_text(player) -> str:
 
 
 # =========================================================
-#                  FSM-СОСТОЯНИЯ АДМИНКИ
+#                  FSM-СОСТОЯНИЯ АДМИНКИ И ПОЛЬЗОВАТЕЛЯ
 # =========================================================
 
 class AdminAuth(StatesGroup):
@@ -842,12 +915,25 @@ class SetProfile(StatesGroup):
     waiting_nickname = State()
 
 
+class OpenCaptainRecruitment(StatesGroup):
+    waiting_channel = State()
+    waiting_season = State()
+
+
+class ApplyCaptain(StatesGroup):
+    waiting_team_name = State()
+    waiting_experience = State()
+    waiting_info = State()
+
+
 # =========================================================
 #                       КЛАВИАТУРЫ
 # =========================================================
 
 def admin_main_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    kb.button(text="📢 Открыть набор капитанов", callback_data="adm:open_captains")
+    kb.button(text="📂 Заявки капитанов", callback_data="adm:cap_apps:0")
     kb.button(text="➕ Добавить команду", callback_data="adm:add_chat")
     kb.button(text="👑 Чаты капитанов", callback_data="adm:captains_menu")
     kb.button(text="📋 Список команд", callback_data="adm:list_chats")
@@ -1017,13 +1103,25 @@ def bans_list_kb(bans) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def profile_menu_kb(player=None) -> InlineKeyboardMarkup:
+def profile_menu_kb(player=None, active_recruitment=None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    if active_recruitment:
+        season_text = active_recruitment['season']
+        kb.button(text=f"📝 Подать заявку на капитана RPL {season_text}", callback_data="cap_apply:start")
     if not (player and player["steam_id"]):
         kb.button(text="🔗 Привязать SteamID", callback_data="profile:steamid")
     kb.button(text="✏️ Указать Ник и Номер", callback_data="profile:nickname")
     kb.button(text="📋 Составы команд", callback_data="profile:teams")
     kb.button(text="📜 Моя история команд", callback_data="profile:history")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def captain_app_user_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Редактировать заявку", callback_data="cap_apply:edit")
+    kb.button(text="🗑 Удалить заявку", callback_data="cap_apply:delete_confirm")
+    kb.button(text="🏠 В профиль", callback_data="profile:menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -1188,6 +1286,141 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("🔐 <b>Админ-панель RPL / FPHL</b>", reply_markup=admin_main_menu())
     await call.answer()
 
+
+# ---------- НАБОР КАПИТАНОВ (АДМИНКА) ----------
+
+@panel_router.callback_query(F.data == "adm:open_captains")
+async def cb_admin_open_captains(call: CallbackQuery, state: FSMContext):
+    await state.set_state(OpenCaptainRecruitment.waiting_channel)
+    await call.message.edit_text(
+        "📢 <b>Открытие набора капитанов</b>\n\n"
+        "1️⃣ Введите <b>юзернейм канала лиги</b> (например, <code>@rpl_channel</code>):",
+        reply_markup=back_to_menu_kb(),
+    )
+    await call.answer()
+
+
+@panel_router.message(OpenCaptainRecruitment.waiting_channel)
+async def process_recruitment_channel(message: Message, state: FSMContext):
+    channel = message.text.strip()
+    await state.update_data(rec_channel=channel)
+    await state.set_state(OpenCaptainRecruitment.waiting_season)
+    await message.answer(
+        "2️⃣ Введите <b>сезон</b> (например, <code>6</code> или <code>6 сезон</code>):"
+    )
+
+
+@panel_router.message(OpenCaptainRecruitment.waiting_season)
+async def process_recruitment_season(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    channel = data.get("rec_channel", "")
+    season = message.text.strip()
+    await state.clear()
+
+    rec = await create_recruitment(channel, season)
+    await message.answer(
+        f"✅ <b>Набор капитанов успешно открыт!</b>\n"
+        f"📢 Канал: <code>{esc(rec['channel_username'])}</code>\n"
+        f"🏆 Сезон: <b>{esc(rec['season'])}</b>\n\n"
+        "🚀 Запущена рассылка игрокам..."
+    )
+
+    asyncio.create_task(broadcast_captain_recruitment(bot, rec['channel_username'], rec['season']))
+
+
+async def broadcast_captain_recruitment(bot: Bot, channel: str, season: str):
+    text = (
+        f"🔥 <b>Открыт набор капитанов на {esc(season)} сезон!</b>\n\n"
+        f"📢 Официальный канал лиги: {esc(channel)}\n\n"
+        "Если вы хотите создать и возглавить команду в новом сезоне — нажимайте кнопку ниже и подавайте заявку!"
+    )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📝 Подать заявку", callback_data="cap_apply:start")
+
+    player_ids = await get_all_known_player_ids()
+    sent_count = 0
+    for tg_id in player_ids:
+        try:
+            await bot.send_message(tg_id, text, reply_markup=kb.as_markup())
+            sent_count += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    logging.info(f"📢 Рассылка о наборе капитанов завершена. Успешно отправлено: {sent_count}/{len(player_ids)}")
+
+
+@panel_router.callback_query(F.data.startswith("adm:cap_apps:"))
+async def cb_admin_list_cap_apps(call: CallbackQuery):
+    page = int(call.data.split(":")[2])
+    limit = 10
+    offset = page * limit
+    apps, total = await get_all_captain_applications(limit, offset)
+
+    if not apps:
+        await call.message.edit_text("📂 Поданных заявок на капитана пока нет.", reply_markup=back_to_menu_kb())
+        await call.answer()
+        return
+
+    kb = InlineKeyboardBuilder()
+    for app in apps:
+        user_str = f"@{app['username']}" if app['username'] else f"ID: {app['tg_id']}"
+        label = f"📋 {app['team_name']} | {user_str}"
+        kb.button(text=label, callback_data=f"adm:cap_app_view:{app['id']}")
+
+    total_pages = (total + limit - 1) // limit
+    if page > 0:
+        kb.button(text="◀️ Назад", callback_data=f"adm:cap_apps:{page - 1}")
+    if (page + 1) < total_pages:
+        kb.button(text="Вперёд ▶️", callback_data=f"adm:cap_apps:{page + 1}")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+
+    text = f"📂 <b>Заявки на капитанов ({total}):</b> (Стр. {page + 1}/{total_pages})"
+    await call.message.edit_text(text, reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@panel_router.callback_query(F.data.startswith("adm:cap_app_view:"))
+async def cb_admin_view_cap_app(call: CallbackQuery):
+    app_id = int(call.data.split(":")[2])
+    app = await get_captain_application_by_id(app_id)
+    if not app:
+        await call.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    user_tag = f"@{esc(app['username'])}" if app["username"] else "—"
+    created = app["created_at"].astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
+
+    text = (
+        f"📋 <b>Заявка на капитана #{app['id']}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 <b>Игрок:</b> {esc(app['full_name'])} ({user_tag})\n"
+        f"🆔 <b>TG ID:</b> <code>{app['tg_id']}</code>\n"
+        f"🏆 <b>Сезон:</b> {esc(app['season'])}\n"
+        f"🛡 <b>Название команды:</b> {esc(app['team_name'])}\n"
+        f"📜 <b>Опыт:</b> {esc(app['experience'])}\n"
+        f"ℹ️ <b>Доп. инфо:</b> {esc(app['info'] or '—')}\n"
+        f"🕒 <b>Дата подачи:</b> {created}"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗑 Удалить заявку", callback_data=f"adm:cap_app_del:{app['id']}")
+    kb.button(text="⬅️ К списку заявок", callback_data="adm:cap_apps:0")
+    kb.adjust(1)
+
+    await call.message.edit_text(text, reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@panel_router.callback_query(F.data.startswith("adm:cap_app_del:"))
+async def cb_admin_del_cap_app(call: CallbackQuery):
+    app_id = int(call.data.split(":")[2])
+    await delete_captain_application_by_id(app_id)
+    await call.answer("🗑 Заявка удалена", show_alert=True)
+    await cb_admin_list_cap_apps(call)
+
+
+# ---------- ВСЕ ОСТАЛЬНЫЕ АДМИН-ХЕНДЛЕРЫ ----------
 
 @panel_router.callback_query(F.data == "adm:rebuild_wl")
 async def cb_rebuild_whitelist(call: CallbackQuery):
@@ -2219,8 +2452,138 @@ async def dm_start(message: Message, bot: Bot):
 
     await sync_player_chats_and_team(bot, tg_id)
     player = await get_player(tg_id)
+    active_rec = await get_active_recruitment()
     text = await build_profile_text(player)
-    await message.answer(text, reply_markup=profile_menu_kb(player))
+    await message.answer(text, reply_markup=profile_menu_kb(player, active_rec))
+
+
+# ---------- ПОДАЧА И УПРАВЛЕНИЕ ЗАЯВКОЙ КАПИТАНА ----------
+
+async def show_user_captain_application(target, app):
+    user_tag = f"@{esc(app['username'])}" if app["username"] else "—"
+    created = app["created_at"].astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
+
+    text = (
+        f"📋 <b>Ваша заявка на капитана ({esc(app['season'])} сезон):</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 <b>Заявитель:</b> {esc(app['full_name'])} ({user_tag})\n"
+        f"🛡 <b>Название команды:</b> {esc(app['team_name'])}\n"
+        f"📜 <b>Опыт:</b> {esc(app['experience'])}\n"
+        f"ℹ️ <b>Доп. информация:</b> {esc(app['info'] or '—')}\n"
+        f"🕒 <b>Подана:</b> {created}\n\n"
+        "<i>Вы можете отредактировать или удалить свою заявку ниже.</i>"
+    )
+    if isinstance(target, Message):
+        await target.answer(text, reply_markup=captain_app_user_kb())
+    else:
+        await target.message.edit_text(text, reply_markup=captain_app_user_kb())
+
+
+@dm_router.callback_query(F.data == "cap_apply:start")
+async def cb_cap_apply_start(call: CallbackQuery, state: FSMContext):
+    tg_id = call.from_user.id
+    app = await get_captain_application(tg_id)
+    if app:
+        await show_user_captain_application(call, app)
+        await call.answer()
+        return
+
+    rec = await get_active_recruitment()
+    season = rec["season"] if rec else "RPL"
+
+    await state.update_data(cap_season=season)
+    await state.set_state(ApplyCaptain.waiting_team_name)
+    await call.message.answer(
+        f"📝 <b>Подача заявки на капитана ({esc(season)} сезон)</b>\n\n"
+        "1️⃣ Введите <b>название вашей будущей команды</b>:"
+    )
+    await call.answer()
+
+
+@dm_router.message(ApplyCaptain.waiting_team_name)
+async def process_app_team_name(message: Message, state: FSMContext):
+    team_name = message.text.strip()
+    await state.update_data(cap_team_name=team_name)
+    await state.set_state(ApplyCaptain.waiting_experience)
+    await message.answer(
+        "2️⃣ Опишите ваш <b>опыт капитана или управления командой</b>:"
+    )
+
+
+@dm_router.message(ApplyCaptain.waiting_experience)
+async def process_app_experience(message: Message, state: FSMContext):
+    experience = message.text.strip()
+    await state.update_data(cap_experience=experience)
+    await state.set_state(ApplyCaptain.waiting_info)
+    await message.answer(
+        "3️⃣ Введите <b>дополнительную информацию или контакты</b> (или напишите «нет» / «-»):"
+    )
+
+
+@dm_router.message(ApplyCaptain.waiting_info)
+async def process_app_info(message: Message, state: FSMContext):
+    info = message.text.strip()
+    if info.lower() in ("нет", "-", "no", "пропустить"):
+        info = ""
+
+    data = await state.get_data()
+    season = data.get("cap_season", "RPL")
+    team_name = data.get("cap_team_name", "Команда")
+    experience = data.get("cap_experience", "—")
+
+    await state.clear()
+
+    tg_id = message.from_user.id
+    username = message.from_user.username
+    full_name = message.from_user.full_name
+
+    app = await save_captain_application(
+        tg_id=tg_id,
+        username=username,
+        full_name=full_name,
+        season=season,
+        team_name=team_name,
+        experience=experience,
+        info=info,
+    )
+
+    await message.answer("✅ <b>Ваша заявка успешно отправлена администрации!</b>\n")
+    await show_user_captain_application(message, app)
+
+
+@dm_router.callback_query(F.data == "cap_apply:edit")
+async def cb_cap_apply_edit(call: CallbackQuery, state: FSMContext):
+    tg_id = call.from_user.id
+    app = await get_captain_application(tg_id)
+    season = app["season"] if app else "RPL"
+
+    await state.update_data(cap_season=season)
+    await state.set_state(ApplyCaptain.waiting_team_name)
+    await call.message.edit_text(
+        f"✏️ <b>Редактирование заявки на капитана ({esc(season)} сезон)</b>\n\n"
+        "1️⃣ Введите новое <b>название вашей команды</b>:"
+    )
+    await call.answer()
+
+
+@dm_router.callback_query(F.data == "cap_apply:delete_confirm")
+async def cb_cap_apply_delete_confirm(call: CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔥 Да, удалить заявку", callback_data="cap_apply:delete_execute")
+    kb.button(text="❌ Отмена", callback_data="profile:menu")
+    kb.adjust(1)
+    await call.message.edit_text(
+        "⚠️ <b>Вы уверены, что хотите удалить свою заявку на капитана?</b>",
+        reply_markup=kb.as_markup(),
+    )
+    await call.answer()
+
+
+@dm_router.callback_query(F.data == "cap_apply:delete_execute")
+async def cb_cap_apply_delete_execute(call: CallbackQuery, bot: Bot):
+    await delete_captain_application(call.from_user.id)
+    await call.answer("🗑 Ваша заявка удалена!", show_alert=True)
+    await dm_start(call.message, bot)
 
 
 @dm_router.message(Command("myhistory"))
@@ -2269,8 +2632,9 @@ async def cb_profile_menu(call: CallbackQuery):
     if not player:
         await upsert_player_basic(tg_id, call.from_user.username, call.from_user.full_name)
         player = await get_player(tg_id)
+    active_rec = await get_active_recruitment()
     text = await build_profile_text(player)
-    await call.message.edit_text(text, reply_markup=profile_menu_kb(player))
+    await call.message.edit_text(text, reply_markup=profile_menu_kb(player, active_rec))
     await call.answer()
 
 
@@ -2298,7 +2662,8 @@ async def process_set_steamid(message: Message, state: FSMContext, bot: Bot):
 
     if player and player["steam_id"]:
         await state.clear()
-        await message.answer("❌ SteamID уже привязан к вашему аккаунту и не подлежит изменению.", reply_markup=profile_menu_kb(player))
+        active_rec = await get_active_recruitment()
+        await message.answer("❌ SteamID уже привязан к вашему аккаунту и не подлежит изменению.", reply_markup=profile_menu_kb(player, active_rec))
         return
 
     steam_id = message.text.strip()
@@ -2323,8 +2688,9 @@ async def process_set_steamid(message: Message, state: FSMContext, bot: Bot):
     await sync_player_chats_and_team(bot, tg_id)
 
     player = await get_player(tg_id)
+    active_rec = await get_active_recruitment()
     text = await build_profile_text(player)
-    await message.answer("✅ <b>SteamID успешно привязан!</b> VPS подхватит обновление в течение ~30 секунд.\n\n" + text, reply_markup=profile_menu_kb(player))
+    await message.answer("✅ <b>SteamID успешно привязан!</b> VPS подхватит обновление в течение ~30 секунд.\n\n" + text, reply_markup=profile_menu_kb(player, active_rec))
 
 
 @dm_router.callback_query(F.data == "profile:nickname")
@@ -2358,8 +2724,9 @@ async def process_set_nickname(message: Message, state: FSMContext, bot: Bot):
     await sync_player_chats_and_team(bot, tg_id)
 
     player = await get_player(message.from_user.id)
+    active_rec = await get_active_recruitment()
     text = await build_profile_text(player)
-    await message.answer("✅ <b>Никнейм и номер сохранены!</b>\n\n" + text, reply_markup=profile_menu_kb(player))
+    await message.answer("✅ <b>Никнейм и номер сохранены!</b>\n\n" + text, reply_markup=profile_menu_kb(player, active_rec))
 
 
 async def build_roster_text(bot: Bot, chat) -> str:
