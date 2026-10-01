@@ -195,9 +195,10 @@ async def init_pool():
                 username TEXT,
                 full_name TEXT NOT NULL,
                 season TEXT NOT NULL,
-                team_name TEXT NOT NULL,
+                nickname TEXT NOT NULL,
+                hours TEXT NOT NULL,
                 experience TEXT NOT NULL,
-                info TEXT,
+                team_name TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
@@ -214,6 +215,8 @@ async def init_pool():
             "ALTER TABLE chats ADD COLUMN IF NOT EXISTS logo_emoji_id TEXT",
             "ALTER TABLE chats ADD COLUMN IF NOT EXISTS logo_emoji TEXT",
             "ALTER TABLE bans ADD COLUMN IF NOT EXISTS league TEXT NOT NULL DEFAULT 'ALL'",
+            "ALTER TABLE captain_applications ADD COLUMN IF NOT EXISTS nickname TEXT",
+            "ALTER TABLE captain_applications ADD COLUMN IF NOT EXISTS hours TEXT",
         ]
         for cmd in alter_commands:
             try:
@@ -747,23 +750,24 @@ async def get_active_recruitment():
         )
 
 
-async def save_captain_application(tg_id: int, username: str | None, full_name: str, season: str, team_name: str, experience: str, info: str):
+async def save_captain_application(tg_id: int, username: str | None, full_name: str, season: str, nickname: str, hours: str, experience: str, team_name: str):
     async with _pool.acquire() as conn:
         return await conn.fetchrow(
             """
-            INSERT INTO captain_applications (tg_id, username, full_name, season, team_name, experience, info)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO captain_applications (tg_id, username, full_name, season, nickname, hours, experience, team_name)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (tg_id) DO UPDATE SET
                 username = EXCLUDED.username,
                 full_name = EXCLUDED.full_name,
                 season = EXCLUDED.season,
-                team_name = EXCLUDED.team_name,
+                nickname = EXCLUDED.nickname,
+                hours = EXCLUDED.hours,
                 experience = EXCLUDED.experience,
-                info = EXCLUDED.info,
+                team_name = EXCLUDED.team_name,
                 updated_at = NOW()
             RETURNING *
             """,
-            tg_id, username, full_name, season, team_name, experience, info,
+            tg_id, username, full_name, season, nickname, hours, experience, team_name,
         )
 
 
@@ -921,9 +925,10 @@ class OpenCaptainRecruitment(StatesGroup):
 
 
 class ApplyCaptain(StatesGroup):
-    waiting_team_name = State()
+    waiting_nickname = State()
+    waiting_hours = State()
     waiting_experience = State()
-    waiting_info = State()
+    waiting_team_name = State()
 
 
 # =========================================================
@@ -1107,7 +1112,7 @@ def profile_menu_kb(player=None, active_recruitment=None) -> InlineKeyboardMarku
     kb = InlineKeyboardBuilder()
     if active_recruitment:
         season_text = active_recruitment['season']
-        kb.button(text=f"📝 Подать заявку на капитана RPL {season_text}", callback_data="cap_apply:start")
+        kb.button(text=f"📝 Подать заявку на капитана RPL {season_text} сезон", callback_data="cap_apply:start")
     if not (player and player["steam_id"]):
         kb.button(text="🔗 Привязать SteamID", callback_data="profile:steamid")
     kb.button(text="✏️ Указать Ник и Номер", callback_data="profile:nickname")
@@ -1335,7 +1340,7 @@ async def broadcast_captain_recruitment(bot: Bot, channel: str, season: str):
         "Если вы хотите создать и возглавить команду в новом сезоне — нажимайте кнопку ниже и подавайте заявку!"
     )
     kb = InlineKeyboardBuilder()
-    kb.button(text="📝 Подать заявку", callback_data="cap_apply:start")
+    kb.button(text=f"📝 Подать заявку на капитана RPL {season} сезон", callback_data="cap_apply:start")
 
     player_ids = await get_all_known_player_ids()
     sent_count = 0
@@ -1394,12 +1399,13 @@ async def cb_admin_view_cap_app(call: CallbackQuery):
     text = (
         f"📋 <b>Заявка на капитана #{app['id']}</b>\n"
         "━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 <b>Игрок:</b> {esc(app['full_name'])} ({user_tag})\n"
+        f"👤 <b>Игрок (TG):</b> {esc(app['full_name'])} ({user_tag})\n"
         f"🆔 <b>TG ID:</b> <code>{app['tg_id']}</code>\n"
-        f"🏆 <b>Сезон:</b> {esc(app['season'])}\n"
-        f"🛡 <b>Название команды:</b> {esc(app['team_name'])}\n"
-        f"📜 <b>Опыт:</b> {esc(app['experience'])}\n"
-        f"ℹ️ <b>Доп. инфо:</b> {esc(app['info'] or '—')}\n"
+        f"🏆 <b>Сезон:</b> {esc(app['season'])}\n\n"
+        f"🏷 <b>Ваш Nickname:</b> {esc(app['nickname'])}\n"
+        f"⏰ <b>Ваши часы:</b> {esc(app['hours'])}\n"
+        f"📜 <b>Ваш Опыт:</b> {esc(app['experience'])}\n"
+        f"🛡 <b>Ваша команда:</b> {esc(app['team_name'])}\n\n"
         f"🕒 <b>Дата подачи:</b> {created}"
     )
 
@@ -2466,10 +2472,11 @@ async def show_user_captain_application(target, app):
     text = (
         f"📋 <b>Ваша заявка на капитана ({esc(app['season'])} сезон):</b>\n"
         "━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 <b>Заявитель:</b> {esc(app['full_name'])} ({user_tag})\n"
-        f"🛡 <b>Название команды:</b> {esc(app['team_name'])}\n"
-        f"📜 <b>Опыт:</b> {esc(app['experience'])}\n"
-        f"ℹ️ <b>Доп. информация:</b> {esc(app['info'] or '—')}\n"
+        f"👤 <b>Игрок (TG):</b> {esc(app['full_name'])} ({user_tag})\n\n"
+        f"🏷 <b>Ваш Nickname:</b> {esc(app['nickname'])}\n"
+        f"⏰ <b>Ваши часы:</b> {esc(app['hours'])}\n"
+        f"📜 <b>Ваш Опыт:</b> {esc(app['experience'])}\n"
+        f"🛡 <b>Ваша команда:</b> {esc(app['team_name'])}\n\n"
         f"🕒 <b>Подана:</b> {created}\n\n"
         "<i>Вы можете отредактировать или удалить свою заявку ниже.</i>"
     )
@@ -2492,21 +2499,31 @@ async def cb_cap_apply_start(call: CallbackQuery, state: FSMContext):
     season = rec["season"] if rec else "RPL"
 
     await state.update_data(cap_season=season)
-    await state.set_state(ApplyCaptain.waiting_team_name)
+    await state.set_state(ApplyCaptain.waiting_nickname)
     await call.message.answer(
         f"📝 <b>Подача заявки на капитана ({esc(season)} сезон)</b>\n\n"
-        "1️⃣ Введите <b>название вашей будущей команды</b>:"
+        "1️⃣ Введите ваш <b>Nickname</b>:"
     )
     await call.answer()
 
 
-@dm_router.message(ApplyCaptain.waiting_team_name)
-async def process_app_team_name(message: Message, state: FSMContext):
-    team_name = message.text.strip()
-    await state.update_data(cap_team_name=team_name)
+@dm_router.message(ApplyCaptain.waiting_nickname)
+async def process_app_nickname(message: Message, state: FSMContext):
+    nickname = message.text.strip()
+    await state.update_data(cap_nickname=nickname)
+    await state.set_state(ApplyCaptain.waiting_hours)
+    await message.answer(
+        "2️⃣ Укажите <b>Ваши часы</b>:"
+    )
+
+
+@dm_router.message(ApplyCaptain.waiting_hours)
+async def process_app_hours(message: Message, state: FSMContext):
+    hours = message.text.strip()
+    await state.update_data(cap_hours=hours)
     await state.set_state(ApplyCaptain.waiting_experience)
     await message.answer(
-        "2️⃣ Опишите ваш <b>опыт капитана или управления командой</b>:"
+        "3️⃣ Опишите <b>Ваш Опыт</b>:"
     )
 
 
@@ -2514,21 +2531,19 @@ async def process_app_team_name(message: Message, state: FSMContext):
 async def process_app_experience(message: Message, state: FSMContext):
     experience = message.text.strip()
     await state.update_data(cap_experience=experience)
-    await state.set_state(ApplyCaptain.waiting_info)
+    await state.set_state(ApplyCaptain.waiting_team_name)
     await message.answer(
-        "3️⃣ Введите <b>дополнительную информацию или контакты</b> (или напишите «нет» / «-»):"
+        "4️⃣ Укажите <b>Вашу команду</b>:"
     )
 
 
-@dm_router.message(ApplyCaptain.waiting_info)
-async def process_app_info(message: Message, state: FSMContext):
-    info = message.text.strip()
-    if info.lower() in ("нет", "-", "no", "пропустить"):
-        info = ""
-
+@dm_router.message(ApplyCaptain.waiting_team_name)
+async def process_app_team_name(message: Message, state: FSMContext):
+    team_name = message.text.strip()
     data = await state.get_data()
     season = data.get("cap_season", "RPL")
-    team_name = data.get("cap_team_name", "Команда")
+    nickname = data.get("cap_nickname", "—")
+    hours = data.get("cap_hours", "—")
     experience = data.get("cap_experience", "—")
 
     await state.clear()
@@ -2542,9 +2557,10 @@ async def process_app_info(message: Message, state: FSMContext):
         username=username,
         full_name=full_name,
         season=season,
-        team_name=team_name,
+        nickname=nickname,
+        hours=hours,
         experience=experience,
-        info=info,
+        team_name=team_name,
     )
 
     await message.answer("✅ <b>Ваша заявка успешно отправлена администрации!</b>\n")
@@ -2558,10 +2574,10 @@ async def cb_cap_apply_edit(call: CallbackQuery, state: FSMContext):
     season = app["season"] if app else "RPL"
 
     await state.update_data(cap_season=season)
-    await state.set_state(ApplyCaptain.waiting_team_name)
+    await state.set_state(ApplyCaptain.waiting_nickname)
     await call.message.edit_text(
         f"✏️ <b>Редактирование заявки на капитана ({esc(season)} сезон)</b>\n\n"
-        "1️⃣ Введите новое <b>название вашей команды</b>:"
+        "1️⃣ Введите ваш <b>Nickname</b>:"
     )
     await call.answer()
 
