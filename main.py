@@ -49,7 +49,6 @@ PUCK_BOT_USERNAME = "@rplpuck_bot"
 SCHEDULER_INTERVAL = 20
 WARNING_AUTODELETE_SECONDS = 10
 ADMIN_RIGHTS_CHECK_INTERVAL = 300
-ROSTER_CHECK_INTERVAL = 300
 STEAM_REMINDER_INTERVAL = 10800
 
 # ---------- GitHub Gist (whitelist transport) ----------
@@ -725,6 +724,7 @@ async def get_exceptions():
             ORDER BY e.id DESC
             """
         )
+
 
 # ---------- НАБОР И ЗАЯВКИ КАПИТАНОВ ----------
 
@@ -1732,7 +1732,7 @@ async def process_admin_set_nickname(message: Message, state: FSMContext, bot: B
     new_nick = message.text.strip()
     await set_player_nickname(tg_id, new_nick)
     await state.clear()
-    await sync_player_chats_and_team(bot, tg_id)
+    await sync_player_chats_and_team(bot, tg_id, notify=False)
     await message.answer("✅ Никнейм игрока обновлён!")
     await show_admin_player_card(message, tg_id)
 
@@ -1766,7 +1766,7 @@ async def process_admin_set_steamid(message: Message, state: FSMContext, bot: Bo
 
     await set_player_steam(tg_id, new_steam)
     await state.clear()
-    await sync_player_chats_and_team(bot, tg_id)
+    await sync_player_chats_and_team(bot, tg_id, notify=False)
     await message.answer("✅ SteamID игрока обновлён! VPS подхватит обновление в течение ~30 секунд.")
     await show_admin_player_card(message, tg_id)
 
@@ -2424,7 +2424,8 @@ async def cb_unban(call: CallbackQuery):
 #           СИНХРОНИЗАЦИЯ СОСТАВОВ И ЛС БОТА
 # =========================================================
 
-async def sync_player_chats_and_team(bot: Bot, tg_id: int):
+async def sync_player_chats_and_team(bot: Bot, tg_id: int, notify: bool = True):
+    """Синхронизирует список чатов игрока и пересчитывает его команду."""
     chats = await get_chats()
     for chat in chats:
         try:
@@ -2433,9 +2434,10 @@ async def sync_player_chats_and_team(bot: Bot, tg_id: int):
                 await add_player_chat(tg_id, chat["chat_id"])
             else:
                 await remove_player_chat(tg_id, chat["chat_id"])
-        except Exception:
-            pass
-    await recompute_player_team(bot, tg_id)
+        except Exception as e:
+            # Не смогли проверить — не трогаем запись
+            logging.debug(f"Не удалось проверить членство {tg_id} в {chat['chat_id']}: {e}")
+    await recompute_player_team(bot, tg_id, notify=notify)
 
 
 @dm_router.message(CommandStart())
@@ -2456,7 +2458,7 @@ async def dm_start(message: Message, bot: Bot):
         await message.answer(ban_text)
         return
 
-    await sync_player_chats_and_team(bot, tg_id)
+    await sync_player_chats_and_team(bot, tg_id, notify=False)
     player = await get_player(tg_id)
     active_rec = await get_active_recruitment()
     text = await build_profile_text(player)
@@ -2701,7 +2703,7 @@ async def process_set_steamid(message: Message, state: FSMContext, bot: Bot):
     await set_player_steam(tg_id, steam_id)
     await state.clear()
 
-    await sync_player_chats_and_team(bot, tg_id)
+    await sync_player_chats_and_team(bot, tg_id, notify=False)
 
     player = await get_player(tg_id)
     active_rec = await get_active_recruitment()
@@ -2737,7 +2739,7 @@ async def process_set_nickname(message: Message, state: FSMContext, bot: Bot):
     await set_player_nickname(tg_id, nickname)
     await state.clear()
 
-    await sync_player_chats_and_team(bot, tg_id)
+    await sync_player_chats_and_team(bot, tg_id, notify=False)
 
     player = await get_player(message.from_user.id)
     active_rec = await get_active_recruitment()
@@ -2880,8 +2882,8 @@ async def cmd_checkplayers(message: Message, bot: Bot):
         )
         return
 
-    status_msg = await message.answer("🔄 Запущена ручная проверка составов...")
-    await sync_all_rosters(bot)
+    status_msg = await message.answer("🔄 Запущена ручная проверка составов (с обновлением username)...")
+    await sync_all_rosters(bot, refresh_usernames=True)
     await status_msg.edit_text("✅ <b>Проверка составов всех команд успешно завершена!</b>")
 
 
@@ -2915,7 +2917,15 @@ async def team_chat_gate(message: Message, bot: Bot):
         return
 
     player = await get_player(tg_id)
-    if not player or not player["steam_id"] or not player["nickname"]:
+    if not player:
+        await upsert_player_basic(tg_id, message.from_user.username, message.from_user.full_name)
+        player = await get_player(tg_id)
+    elif player["username"] != message.from_user.username or player["first_name"] != message.from_user.full_name:
+        # Игрок сменил @username или имя — обновляем в БД
+        await upsert_player_basic(tg_id, message.from_user.username, message.from_user.full_name)
+        logging.info(f"🔄 Обновлён профиль {tg_id}: @{message.from_user.username}")
+
+    if not player["steam_id"] or not player["nickname"]:
         try:
             await message.delete()
         except Exception:
@@ -2940,32 +2950,54 @@ async def team_chat_gate(message: Message, bot: Bot):
             return
 
 
-async def recompute_player_team(bot: Bot, tg_id: int):
+async def recompute_player_team(bot: Bot, tg_id: int, notify: bool = False):
+    """Пересчитывает team_chat_id игрока.
+
+    Логика:
+      - 0 чатов  → team_chat_id = None (Free Agent)
+      - 1 чат    → team_chat_id = этот чат
+      - 2+ чатов → если текущая команда среди них — оставляем её (не сбрасываем!),
+                   иначе — сбрасываем и (при notify=True) предлагаем выбрать.
+    """
     if await is_exception(tg_id):
         return
 
-    chat_ids = await get_player_chat_ids(tg_id)
+    chat_ids = set(await get_player_chat_ids(tg_id))
+    player = await get_player(tg_id)
+    current_team = player["team_chat_id"] if player else None
 
-    if len(chat_ids) <= 1:
-        await set_player_team(tg_id, chat_ids[0] if chat_ids else None)
+    if not chat_ids:
+        if current_team is not None:
+            await set_player_team(tg_id, None)
         return
 
-    await set_player_team(tg_id, None)
-    kb = InlineKeyboardBuilder()
-    for cid in chat_ids:
-        chat_info = await get_chat(cid)
-        name = chat_info["name"] if chat_info else str(cid)
-        league = chat_info["league"] if chat_info else "RPL"
-        kb.button(text=f"🏒 [{league}] {name}", callback_data=f"chooseteam:{cid}")
-    kb.adjust(1)
-    try:
-        await bot.send_message(
-            tg_id,
-            "⚠️ Вы состоите сразу в нескольких командных чатах RPL/FPHL.\nПожалуйста, выберите вашу команду:",
-            reply_markup=kb.as_markup(),
-        )
-    except Exception as e:
-        logging.warning(f"Не удалось отправить выбор команды игроку {tg_id}: {e}")
+    if len(chat_ids) == 1:
+        only_chat = next(iter(chat_ids))
+        if current_team != only_chat:
+            await set_player_team(tg_id, only_chat)
+        return
+
+    # 2+ чатов
+    if current_team not in chat_ids and current_team is not None:
+        await set_player_team(tg_id, None)
+
+    if notify:
+        kb = InlineKeyboardBuilder()
+        for cid in chat_ids:
+            chat_info = await get_chat(cid)
+            name = chat_info["name"] if chat_info else str(cid)
+            league = chat_info["league"] if chat_info else "RPL"
+            kb.button(text=f"🏒 [{league}] {name}", callback_data=f"chooseteam:{cid}")
+        kb.adjust(1)
+        try:
+            await bot.send_message(
+                tg_id,
+                "⚠️ Вы состоите сразу в нескольких командных чатах RPL/FPHL.\n"
+                "Выберите вашу основную команду:",
+                reply_markup=kb.as_markup(),
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось отправить выбор команды игроку {tg_id}: {e}")
 
 
 @team_chat_router.chat_member()
@@ -2985,21 +3017,35 @@ async def on_team_chat_member_update(update: ChatMemberUpdated, bot: Bot):
     if is_member and not was_member:
         await upsert_player_basic(user.id, user.username, user.full_name)
         await add_player_chat(user.id, update.chat.id)
-        await recompute_player_team(bot, user.id)
+        await recompute_player_team(bot, user.id, notify=True)
     elif was_member and not is_member:
         await remove_player_chat(user.id, update.chat.id)
-        await recompute_player_team(bot, user.id)
+        await recompute_player_team(bot, user.id, notify=False)
 
 
 # =========================================================
-#            АВТОМАТИЧЕСКАЯ ПРОВЕРКА СОСТАВОВ (5 МИН)
+#     ПЛАНОВАЯ ПРОВЕРКА СОСТАВОВ КАЖДЫЕ 4 ЧАСА + ОБНОВЛЕНИЕ USERNAME
 # =========================================================
 
-async def sync_all_rosters(bot: Bot):
+async def sync_all_rosters(bot: Bot, refresh_usernames: bool = False):
+    """
+    Полная проверка всех игроков во всех командных чатах.
+    Если refresh_usernames=True — также обновляет username/first_name из Telegram.
+    """
     known_players = await get_all_known_player_ids()
     chats = await get_chats()
     if not chats or not known_players:
         return
+
+    # Кэшируем игроков, чтобы не дёргать БД в цикле
+    players_map: dict[int, asyncpg.Record] = {}
+    if refresh_usernames:
+        for tg_id in known_players:
+            p = await get_player(tg_id)
+            if p:
+                players_map[tg_id] = p
+
+    updated_usernames = 0
 
     for chat in chats:
         chat_id = chat["chat_id"]
@@ -3009,28 +3055,69 @@ async def sync_all_rosters(bot: Bot):
             try:
                 member = await bot.get_chat_member(chat_id, tg_id)
                 is_in_chat = member.status in ("member", "administrator", "creator")
-            except Exception:
-                is_in_chat = False
+            except Exception as e:
+                # Не смогли проверить — не трогаем игрока
+                logging.debug(f"Не удалось проверить {tg_id} в чате {chat_id}: {e}")
+                continue
 
             is_linked = tg_id in linked_ids
 
-            if is_in_chat and not is_linked:
-                await add_player_chat(tg_id, chat_id)
-                await recompute_player_team(bot, tg_id)
-            elif not is_in_chat and is_linked:
-                await remove_player_chat(tg_id, chat_id)
-                await recompute_player_team(bot, tg_id)
+            if is_in_chat:
+                if not is_linked:
+                    await add_player_chat(tg_id, chat_id)
+                    await recompute_player_team(bot, tg_id, notify=False)
+
+                if refresh_usernames:
+                    p = players_map.get(tg_id)
+                    new_username = member.user.username
+                    new_first_name = member.user.full_name
+                    if p and (p["username"] != new_username or p["first_name"] != new_first_name):
+                        await upsert_player_basic(tg_id, new_username, new_first_name)
+                        # локально обновим кэш чтобы не апдейтить в след. чате
+                        players_map[tg_id] = dict(p)
+                        players_map[tg_id]["username"] = new_username
+                        players_map[tg_id]["first_name"] = new_first_name
+                        updated_usernames += 1
+            else:
+                if is_linked:
+                    await remove_player_chat(tg_id, chat_id)
+                    await recompute_player_team(bot, tg_id, notify=False)
 
             await asyncio.sleep(0.01)
 
+    if refresh_usernames and updated_usernames > 0:
+        logging.info(f"🔄 Обновлено username у {updated_usernames} игроков")
 
-async def auto_roster_check_loop(bot: Bot):
+
+async def scheduled_roster_sync_loop(bot: Bot):
+    """
+    Запускает полную проверку составов + обновление username каждый раз
+    в 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 МСК.
+    """
     while True:
+        now = datetime.now(MSK)
+        # Ищем следующий час, кратный 4
+        next_hour = ((now.hour // 4) + 1) * 4
+        target = now.replace(minute=0, second=0, microsecond=0)
+        if next_hour >= 24:
+            target = (target + timedelta(days=1)).replace(hour=next_hour - 24)
+        else:
+            target = target.replace(hour=next_hour)
+
+        seconds_until = (target - now).total_seconds()
+        logging.info(f"⏳ Следующая плановая проверка составов: {target.strftime('%d.%m.%Y %H:%M МСК')} (через {int(seconds_until)} сек)")
+
+        await asyncio.sleep(seconds_until)
+
         try:
-            await sync_all_rosters(bot)
+            logging.info("🔄 Запущена плановая проверка составов + обновление username...")
+            await sync_all_rosters(bot, refresh_usernames=True)
+            logging.info("✅ Плановая проверка составов завершена")
         except Exception as e:
-            logging.warning(f"⚠️ Ошибка в автоматической проверке составов: {e}")
-        await asyncio.sleep(ROSTER_CHECK_INTERVAL)
+            logging.error(f"⚠️ Ошибка плановой проверки составов: {e}")
+
+        # Пауза 60 сек, чтобы не запуститься дважды в ту же минуту
+        await asyncio.sleep(60)
 
 
 # =========================================================
@@ -3237,8 +3324,8 @@ async def main():
     asyncio.create_task(admin_rights_check_loop(bot))
     logging.info("✅ Запущена регулярная проверка прав бота в чатах")
 
-    asyncio.create_task(auto_roster_check_loop(bot))
-    logging.info("✅ Запущена автопроверка составов каждые 5 минут")
+    asyncio.create_task(scheduled_roster_sync_loop(bot))
+    logging.info("✅ Запущен планировщик составов (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 МСК)")
 
     asyncio.create_task(daily_report_loop(bot))
     logging.info("✅ Запущен таймер ежедневного отчёта по SteamID (14:30 МСК)")
